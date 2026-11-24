@@ -1,5 +1,6 @@
 import pandas as pd
 
+from app.anomaly.detector import detect_numeric_anomalies
 from app.quality.rules import (
     detect_duplicate_rows,
     detect_missing_values,
@@ -43,6 +44,7 @@ def analyze_dataset(
     issues = (
         detect_missing_values(df)
         + detect_duplicate_rows(df)
+        + detect_numeric_anomalies(df)
     )
 
     missing_penalty = (

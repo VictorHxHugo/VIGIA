@@ -40,3 +40,24 @@ def test_quality_engine_detects_duplicate_rows():
     issue_codes = {issue.code for issue in report.issues}
 
     assert "DUPLICATE_ROWS" in issue_codes
+
+
+def test_quality_engine_detects_numeric_anomalies():
+    df = pd.DataFrame(
+        {
+            "value": [10, 11, 12, 11, 13, 100],
+        }
+    )
+
+    report = analyze_dataset(df, "numeric_anomaly_test")
+
+    anomaly_issues = [
+        issue
+        for issue in report.issues
+        if issue.code == "NUMERIC_ANOMALIES"
+    ]
+
+    assert len(anomaly_issues) == 1
+    assert anomaly_issues[0].column == "value"
+    assert anomaly_issues[0].affected_rows == 1
+    assert anomaly_issues[0].examples == [5]
