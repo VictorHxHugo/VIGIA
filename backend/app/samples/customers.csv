@@ -1,0 +1,10 @@
+customer_id,name,email,age,city
+1,Ana,ana@email.com,25,Santos
+2,Bruno,bruno@email.com,32,Sao Paulo
+3,Carlos,,28,Santos
+4,Daniel,daniel@email.com,,Guaruja
+5,Elisa,elisa@email.com,41,Santos
+5,Elisa,elisa@email.com,41,Santos
+6,Fernanda,fernanda@email.com,29,
+7,Gabriel,gabriel@email.com,35,Sao Paulo
+8,Helena,,22,Santos
