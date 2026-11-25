@@ -19,6 +19,7 @@ from app.incidents.repository import (
     IncidentUnitOfWork,
 )
 from app.incidents.sqlite_repository import SQLiteIncidentRepository
+from app.incidents.service import IncidentProcessingResult, IncidentService
 
 __all__ = [
     "Incident",
@@ -26,11 +27,13 @@ __all__ = [
     "IncidentFilters",
     "IncidentNotFoundError",
     "IncidentOccurrence",
+    "IncidentProcessingResult",
     "IncidentRepository",
     "IncidentRevisionConflictError",
     "IncidentSeverity",
     "IncidentStatus",
     "IncidentStatusChange",
+    "IncidentService",
     "IncidentUnitOfWork",
     "InvalidIncidentTransitionError",
     "SQLiteIncidentRepository",
