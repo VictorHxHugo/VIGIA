@@ -6,10 +6,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.datasets.service import DatasetAnalysisService
+from app.incidents.repository import IncidentRepository
+from app.incidents.service import IncidentService
+from app.incidents.sqlite_repository import SQLiteIncidentRepository
 from app.ingestion.csv_reader import (
     CSVValidationError,
     read_csv_file,
@@ -39,9 +42,12 @@ class SchemaApprovalRequest(BaseModel):
 
 def create_app(
     repository: SchemaRegistryRepository | None = None,
+    incident_repository: IncidentRepository | None = None,
 ) -> FastAPI:
     """Create the API and wire its application services."""
-    if repository is None:
+    schema_registry_repository: SchemaRegistryRepository
+    incident_persistence_repository: IncidentRepository
+    if repository is None and incident_repository is None:
         configured_path = os.environ.get("VIGIA_DATABASE_PATH")
         if configured_path is not None and not configured_path.strip():
             raise ValueError("VIGIA_DATABASE_PATH must not be empty.")
@@ -53,10 +59,22 @@ def create_app(
             / "data"
             / "schema_registry.sqlite3"
         )
-        repository = SQLiteSchemaRegistryRepository(database_path)
+        schema_registry_repository = SQLiteSchemaRegistryRepository(database_path)
+        incident_persistence_repository = SQLiteIncidentRepository(database_path)
+    elif repository is None or incident_repository is None:
+        raise ValueError(
+            "repository and incident_repository must be provided together."
+        )
+    else:
+        schema_registry_repository = repository
+        incident_persistence_repository = incident_repository
 
-    schema_registry_service = SchemaRegistryService(repository)
-    dataset_analysis_service = DatasetAnalysisService(schema_registry_service)
+    schema_registry_service = SchemaRegistryService(schema_registry_repository)
+    incident_service = IncidentService(incident_persistence_repository)
+    dataset_analysis_service = DatasetAnalysisService(
+        schema_registry_service,
+        incident_service,
+    )
 
     app = FastAPI(
         title="VIGIA API",
@@ -86,8 +104,33 @@ def create_app(
     async def analyze_csv(
         file: Annotated[UploadFile, File(...)],
         dataset_id: Annotated[str, Form(...)],
+        analysis_id: Annotated[
+            str,
+            Header(
+                alias="Idempotency-Key",
+                description=(
+                    "Reuse the same key when retrying the same request after "
+                    "a timeout or communication failure."
+                ),
+            ),
+        ],
     ):
+        """Analyze a dataset; clients should reuse the key on communication retries."""
         try:
+            if (
+                not analysis_id
+                or analysis_id.isspace()
+                or analysis_id[0].isspace()
+                or analysis_id[-1].isspace()
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "Idempotency-Key must be non-empty and have no "
+                        "surrounding whitespace."
+                    ),
+                )
+
             if not dataset_id or dataset_id != dataset_id.strip():
                 raise HTTPException(
                     status_code=400,
@@ -113,6 +156,7 @@ def create_app(
                 df,
                 dataset_id=dataset_id,
                 dataset_name=file.filename,
+                analysis_id=analysis_id,
             )
 
             return {
@@ -124,6 +168,14 @@ def create_app(
                     issue.model_dump(mode="json")
                     for issue in result.schema_drift_issues
                 ],
+                "incident_processing": {
+                    "created_count": result.incident_processing.created_count,
+                    "updated_count": result.incident_processing.updated_count,
+                    "reopened_count": result.incident_processing.reopened_count,
+                    "ignored_occurrence_count": (
+                        result.incident_processing.ignored_occurrence_count
+                    ),
+                },
             }
 
         except CSVValidationError as exc:
