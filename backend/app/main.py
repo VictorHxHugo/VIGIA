@@ -6,11 +6,29 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, Query, UploadFile
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.datasets.service import DatasetAnalysisService
-from app.incidents.repository import IncidentRepository
+from app.incidents.api_schemas import (
+    IncidentCollectionResponse,
+    IncidentOccurrenceCollectionResponse,
+    IncidentResponse,
+    IncidentStatusChangeRequest,
+    IncidentStatusHistoryCollectionResponse,
+)
+from app.incidents.management_service import IncidentManagementService
+from app.incidents.models import (
+    IncidentSeverity,
+    IncidentStatus,
+    InvalidIncidentTransitionError,
+)
+from app.incidents.repository import (
+    IncidentFilters,
+    IncidentNotFoundError,
+    IncidentRepository,
+    IncidentRevisionConflictError,
+)
 from app.incidents.service import IncidentService
 from app.incidents.sqlite_repository import SQLiteIncidentRepository
 from app.ingestion.csv_reader import (
@@ -71,6 +89,9 @@ def create_app(
 
     schema_registry_service = SchemaRegistryService(schema_registry_repository)
     incident_service = IncidentService(incident_persistence_repository)
+    incident_management_service = IncidentManagementService(
+        incident_persistence_repository
+    )
     dataset_analysis_service = DatasetAnalysisService(
         schema_registry_service,
         incident_service,
@@ -83,6 +104,7 @@ def create_app(
     )
     app.state.schema_registry_service = schema_registry_service
     app.state.dataset_analysis_service = dataset_analysis_service
+    app.state.incident_management_service = incident_management_service
 
     @app.get("/")
     def root():
@@ -99,6 +121,183 @@ def create_app(
             "status": "healthy",
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
+
+    @app.get("/incidents", response_model=IncidentCollectionResponse)
+    def list_incidents(
+        dataset_id: str | None = None,
+        status: IncidentStatus | None = None,
+        severity: IncidentSeverity | None = None,
+        code: str | None = None,
+        limit: Annotated[int, Query(ge=1, le=100)] = 50,
+        offset: Annotated[int, Query(ge=0)] = 0,
+    ):
+        try:
+            filters = IncidentFilters(
+                dataset_id=dataset_id,
+                status=status,
+                severity=severity,
+                code=code,
+                limit=limit,
+                offset=offset,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        try:
+            incidents = app.state.incident_management_service.list_incidents(
+                filters
+            )
+        except Exception as exc:
+            logger.exception("Incident listing failed.")
+            raise HTTPException(
+                status_code=500,
+                detail="An unexpected error occurred while listing incidents.",
+            ) from exc
+
+        return {
+            "items": incidents,
+            "limit": limit,
+            "offset": offset,
+        }
+
+    @app.get(
+        "/incidents/{incident_id}/occurrences",
+        response_model=IncidentOccurrenceCollectionResponse,
+    )
+    def list_incident_occurrences(
+        incident_id: str,
+        limit: Annotated[int, Query(ge=1, le=100)] = 50,
+        offset: Annotated[int, Query(ge=0)] = 0,
+    ):
+        if not incident_id.strip():
+            raise HTTPException(
+                status_code=422,
+                detail="incident_id must be a non-empty string.",
+            )
+
+        try:
+            occurrences = app.state.incident_management_service.list_occurrences(
+                incident_id,
+                limit=limit,
+                offset=offset,
+            )
+        except IncidentNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.exception("Incident occurrence lookup failed.")
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "An unexpected error occurred while retrieving incident "
+                    "occurrences."
+                ),
+            ) from exc
+
+        return {
+            "items": occurrences,
+            "limit": limit,
+            "offset": offset,
+        }
+
+    @app.get(
+        "/incidents/{incident_id}/history",
+        response_model=IncidentStatusHistoryCollectionResponse,
+    )
+    def list_incident_history(
+        incident_id: str,
+        limit: Annotated[int, Query(ge=1, le=100)] = 50,
+        offset: Annotated[int, Query(ge=0)] = 0,
+    ):
+        if not incident_id.strip():
+            raise HTTPException(
+                status_code=422,
+                detail="incident_id must be a non-empty string.",
+            )
+
+        try:
+            history = app.state.incident_management_service.list_status_history(
+                incident_id,
+                limit=limit,
+                offset=offset,
+            )
+        except IncidentNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.exception("Incident history lookup failed.")
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "An unexpected error occurred while retrieving incident "
+                    "history."
+                ),
+            ) from exc
+
+        return {
+            "items": history,
+            "limit": limit,
+            "offset": offset,
+        }
+
+    @app.get("/incidents/{incident_id}", response_model=IncidentResponse)
+    def get_incident(incident_id: str):
+        if not incident_id.strip():
+            raise HTTPException(
+                status_code=422,
+                detail="incident_id must be a non-empty string.",
+            )
+
+        try:
+            return app.state.incident_management_service.get_incident(incident_id)
+        except IncidentNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.exception("Incident lookup failed.")
+            raise HTTPException(
+                status_code=500,
+                detail="An unexpected error occurred while retrieving the incident.",
+            ) from exc
+
+    @app.patch(
+        "/incidents/{incident_id}/status",
+        response_model=IncidentResponse,
+    )
+    def change_incident_status(
+        incident_id: str,
+        request: IncidentStatusChangeRequest,
+    ):
+        if not incident_id.strip():
+            raise HTTPException(
+                status_code=422,
+                detail="incident_id must be a non-empty string.",
+            )
+
+        try:
+            return app.state.incident_management_service.change_status(
+                incident_id,
+                request.status,
+                expected_revision=request.expected_revision,
+                actor="api",
+                reason=request.reason,
+            )
+        except IncidentNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except IncidentRevisionConflictError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": str(exc),
+                    "expected_revision": exc.expected_revision,
+                    "current_revision": exc.current_revision,
+                },
+            ) from exc
+        except InvalidIncidentTransitionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.exception("Incident status change failed.")
+            raise HTTPException(
+                status_code=500,
+                detail="An unexpected error occurred while changing incident status.",
+            ) from exc
 
     @app.post("/datasets/analyze")
     async def analyze_csv(

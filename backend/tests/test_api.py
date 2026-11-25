@@ -1,6 +1,15 @@
+from datetime import datetime, timedelta, timezone
+
 from fastapi.testclient import TestClient
 import pytest
 
+from app.incidents.models import (
+    Incident,
+    IncidentOccurrence,
+    IncidentSeverity,
+    IncidentStatus,
+    IncidentStatusChange,
+)
 from app.incidents.repository import IncidentFilters
 from app.incidents.sqlite_repository import SQLiteIncidentRepository
 from app.main import MAX_UPLOAD_SIZE, create_app
@@ -35,6 +44,93 @@ def upload_csv(
         files={"file": (filename, content, "text/csv")},
         headers={"Idempotency-Key": idempotency_key},
     )
+
+
+API_TEST_TIME = datetime(2026, 1, 2, 3, 4, tzinfo=timezone.utc)
+
+
+def make_api_incident(
+    incident_id: str,
+    *,
+    dataset_id: str = "customers",
+    status: IncidentStatus = IncidentStatus.OPEN,
+    severity: IncidentSeverity = IncidentSeverity.HIGH,
+    code: str = "NULL_VALUES",
+    updated_at: datetime = API_TEST_TIME,
+    revision: int = 1,
+    resolved_at: datetime | None = None,
+) -> Incident:
+    return Incident(
+        incident_id=incident_id,
+        dataset_id=dataset_id,
+        fingerprint=f"fingerprint-{incident_id}",
+        code=code,
+        title="Null values found",
+        description="A required field contains null values.",
+        column="email",
+        severity=severity,
+        status=status,
+        created_at=API_TEST_TIME,
+        updated_at=updated_at,
+        first_seen_at=API_TEST_TIME,
+        last_seen_at=updated_at,
+        resolved_at=resolved_at,
+        occurrence_count=1,
+        revision=revision,
+    )
+
+
+def make_api_occurrence(
+    occurrence_id: str,
+    incident_id: str,
+    detected_at: datetime,
+) -> IncidentOccurrence:
+    return IncidentOccurrence(
+        occurrence_id=occurrence_id,
+        incident_id=incident_id,
+        analysis_id=f"analysis-{occurrence_id}",
+        detected_at=detected_at,
+        code="NULL_VALUES",
+        title="Null values found",
+        description="A required field contains null values.",
+        column="email",
+        severity=IncidentSeverity.HIGH,
+        affected_rows=2,
+        examples=(1, 3),
+    )
+
+
+def make_api_status_change(
+    change_id: str,
+    incident_id: str,
+    from_status: IncidentStatus | None,
+    to_status: IncidentStatus,
+    changed_at: datetime,
+) -> IncidentStatusChange:
+    return IncidentStatusChange(
+        change_id=change_id,
+        incident_id=incident_id,
+        from_status=from_status,
+        to_status=to_status,
+        changed_at=changed_at,
+        actor="seed",
+        reason="Seeded test history.",
+    )
+
+
+def store_api_incident(
+    repository: SQLiteIncidentRepository,
+    incident: Incident,
+    *,
+    occurrences: tuple[IncidentOccurrence, ...] = (),
+    history: tuple[IncidentStatusChange, ...] = (),
+) -> None:
+    with repository.transaction() as unit_of_work:
+        unit_of_work.create_incident(incident)
+        for occurrence in occurrences:
+            unit_of_work.record_occurrence(occurrence)
+        for change in history:
+            unit_of_work.record_status_change(change)
 
 
 def test_root_endpoint(api_client):
@@ -618,6 +714,446 @@ def test_schema_approval_rejects_invalid_request_body(api_client):
     response = client.put(
         "/datasets/customers/schema",
         json={"schema": {"id": 123}, "expected_version": 1},
+    )
+
+    assert response.status_code == 422
+
+
+def test_list_incidents_applies_combined_filters_and_pagination(
+    api_client,
+    tmp_path,
+):
+    client, _ = api_client
+    incident_repository = SQLiteIncidentRepository(tmp_path / "registry.sqlite3")
+    matching_older = make_api_incident(
+        "matching-older",
+        updated_at=API_TEST_TIME + timedelta(minutes=1),
+    )
+    matching_newer = make_api_incident(
+        "matching-newer",
+        updated_at=API_TEST_TIME + timedelta(minutes=2),
+    )
+    store_api_incident(incident_repository, matching_older)
+    store_api_incident(incident_repository, matching_newer)
+    store_api_incident(
+        incident_repository,
+        make_api_incident("other-dataset", dataset_id="orders"),
+    )
+    store_api_incident(
+        incident_repository,
+        make_api_incident(
+            "other-status",
+            status=IncidentStatus.ACKNOWLEDGED,
+        ),
+    )
+    store_api_incident(
+        incident_repository,
+        make_api_incident(
+            "other-severity",
+            severity=IncidentSeverity.MEDIUM,
+        ),
+    )
+    store_api_incident(
+        incident_repository,
+        make_api_incident("other-code", code="DUPLICATE_VALUES"),
+    )
+
+    response = client.get(
+        "/incidents",
+        params={
+            "dataset_id": "customers",
+            "status": "OPEN",
+            "severity": "high",
+            "code": "NULL_VALUES",
+            "limit": 1,
+            "offset": 1,
+        },
+    )
+
+    assert response.status_code == 200
+    result = response.json()
+    assert set(result) == {"items", "limit", "offset"}
+    assert [item["incident_id"] for item in result["items"]] == [
+        "matching-older"
+    ]
+    assert result["limit"] == 1
+    assert result["offset"] == 1
+
+
+def test_list_incidents_returns_empty_filtered_collection(api_client):
+    client, _ = api_client
+
+    response = client.get(
+        "/incidents",
+        params={"dataset_id": "unknown-dataset"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "items": [],
+        "limit": 50,
+        "offset": 0,
+    }
+
+
+def test_get_incident_returns_existing_incident_and_404_for_missing(
+    api_client,
+    tmp_path,
+):
+    client, _ = api_client
+    incident_repository = SQLiteIncidentRepository(tmp_path / "registry.sqlite3")
+    incident = make_api_incident("detail-incident")
+    store_api_incident(incident_repository, incident)
+
+    response = client.get(f"/incidents/{incident.incident_id}")
+    missing_response = client.get("/incidents/missing-incident")
+
+    assert response.status_code == 200
+    result = response.json()
+    assert result["incident_id"] == incident.incident_id
+    assert result["dataset_id"] == incident.dataset_id
+    assert result["status"] == incident.status.value
+    assert result["revision"] == incident.revision
+    assert missing_response.status_code == 404
+
+
+def test_incident_occurrences_and_history_return_requested_pages(
+    api_client,
+    tmp_path,
+):
+    client, _ = api_client
+    incident_repository = SQLiteIncidentRepository(tmp_path / "registry.sqlite3")
+    incident = make_api_incident("paged-incident")
+    older_occurrence = make_api_occurrence(
+        "occurrence-older",
+        incident.incident_id,
+        API_TEST_TIME,
+    )
+    newer_occurrence = make_api_occurrence(
+        "occurrence-newer",
+        incident.incident_id,
+        API_TEST_TIME + timedelta(minutes=1),
+    )
+    first_change = make_api_status_change(
+        "change-initial",
+        incident.incident_id,
+        None,
+        IncidentStatus.OPEN,
+        API_TEST_TIME,
+    )
+    second_change = make_api_status_change(
+        "change-acknowledged",
+        incident.incident_id,
+        IncidentStatus.OPEN,
+        IncidentStatus.ACKNOWLEDGED,
+        API_TEST_TIME + timedelta(minutes=1),
+    )
+    store_api_incident(
+        incident_repository,
+        incident,
+        occurrences=(older_occurrence, newer_occurrence),
+        history=(first_change, second_change),
+    )
+
+    occurrences_response = client.get(
+        f"/incidents/{incident.incident_id}/occurrences",
+        params={"limit": 1, "offset": 1},
+    )
+    history_response = client.get(
+        f"/incidents/{incident.incident_id}/history",
+        params={"limit": 1, "offset": 1},
+    )
+
+    assert occurrences_response.status_code == 200
+    occurrences = occurrences_response.json()
+    assert set(occurrences) == {"items", "limit", "offset"}
+    assert [item["occurrence_id"] for item in occurrences["items"]] == [
+        "occurrence-older"
+    ]
+    assert occurrences["items"][0]["examples"] == [1, 3]
+    assert occurrences["limit"] == 1
+    assert occurrences["offset"] == 1
+
+    assert history_response.status_code == 200
+    history = history_response.json()
+    assert set(history) == {"items", "limit", "offset"}
+    assert [item["change_id"] for item in history["items"]] == [
+        "change-acknowledged"
+    ]
+    assert history["limit"] == 1
+    assert history["offset"] == 1
+
+
+def test_empty_incident_occurrences_and_history_return_empty_items(
+    api_client,
+    tmp_path,
+):
+    client, _ = api_client
+    incident_repository = SQLiteIncidentRepository(tmp_path / "registry.sqlite3")
+    incident = make_api_incident("empty-history-incident")
+    store_api_incident(incident_repository, incident)
+
+    occurrences_response = client.get(
+        f"/incidents/{incident.incident_id}/occurrences"
+    )
+    history_response = client.get(f"/incidents/{incident.incident_id}/history")
+
+    assert occurrences_response.status_code == 200
+    assert occurrences_response.json()["items"] == []
+    assert history_response.status_code == 200
+    assert history_response.json()["items"] == []
+
+
+@pytest.mark.parametrize("resource", ["occurrences", "history"])
+def test_incident_occurrences_and_history_return_404_for_missing_parent(
+    api_client,
+    resource,
+):
+    client, _ = api_client
+
+    response = client.get(f"/incidents/missing-incident/{resource}")
+
+    assert response.status_code == 404
+
+
+def test_patch_incident_status_updates_revision_and_records_audit_fields(
+    api_client,
+    tmp_path,
+):
+    client, _ = api_client
+    incident_repository = SQLiteIncidentRepository(tmp_path / "registry.sqlite3")
+    incident = make_api_incident("status-change-incident")
+    store_api_incident(incident_repository, incident)
+
+    reason = "  Reviewed by the on-call operator.  "
+    response = client.patch(
+        f"/incidents/{incident.incident_id}/status",
+        json={
+            "status": "ACKNOWLEDGED",
+            "expected_revision": incident.revision,
+            "reason": reason,
+        },
+    )
+
+    assert response.status_code == 200
+    result = response.json()
+    assert result["status"] == IncidentStatus.ACKNOWLEDGED.value
+    assert result["revision"] == incident.revision + 1
+
+    persisted = incident_repository.get_incident(incident.incident_id)
+    history = incident_repository.list_status_history(incident.incident_id)
+    assert persisted is not None
+    assert persisted.status is IncidentStatus.ACKNOWLEDGED
+    assert persisted.revision == incident.revision + 1
+    assert len(history) == 1
+    assert history[0].actor == "api"
+    assert history[0].reason == reason
+
+
+def test_patch_repeating_current_status_is_successful_no_op(
+    api_client,
+    tmp_path,
+):
+    client, _ = api_client
+    incident_repository = SQLiteIncidentRepository(tmp_path / "registry.sqlite3")
+    incident = make_api_incident(
+        "unchanged-status-incident",
+        status=IncidentStatus.ACKNOWLEDGED,
+    )
+    existing_change = make_api_status_change(
+        "existing-acknowledged-change",
+        incident.incident_id,
+        None,
+        IncidentStatus.ACKNOWLEDGED,
+        API_TEST_TIME,
+    )
+    store_api_incident(
+        incident_repository,
+        incident,
+        history=(existing_change,),
+    )
+
+    response = client.patch(
+        f"/incidents/{incident.incident_id}/status",
+        json={
+            "status": IncidentStatus.ACKNOWLEDGED.value,
+            "expected_revision": incident.revision,
+            "reason": "No transition requested.",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["revision"] == incident.revision
+    assert incident_repository.get_incident(incident.incident_id) == incident
+    assert incident_repository.list_status_history(incident.incident_id) == [
+        existing_change
+    ]
+
+
+def test_patch_invalid_status_transition_returns_conflict_without_changes(
+    api_client,
+    tmp_path,
+):
+    client, _ = api_client
+    incident_repository = SQLiteIncidentRepository(tmp_path / "registry.sqlite3")
+    incident = make_api_incident(
+        "resolved-incident",
+        status=IncidentStatus.RESOLVED,
+        resolved_at=API_TEST_TIME,
+    )
+    store_api_incident(incident_repository, incident)
+
+    response = client.patch(
+        f"/incidents/{incident.incident_id}/status",
+        json={
+            "status": IncidentStatus.OPEN.value,
+            "expected_revision": incident.revision,
+            "reason": "Manual reopen attempt.",
+        },
+    )
+
+    assert response.status_code == 409
+    assert incident_repository.get_incident(incident.incident_id) == incident
+    assert incident_repository.list_status_history(incident.incident_id) == []
+
+
+def test_patch_missing_incident_returns_404(api_client):
+    client, _ = api_client
+
+    response = client.patch(
+        "/incidents/missing-incident/status",
+        json={
+            "status": IncidentStatus.ACKNOWLEDGED.value,
+            "expected_revision": 1,
+            "reason": "Incident should not exist.",
+        },
+    )
+
+    assert response.status_code == 404
+
+
+def test_patch_stale_revision_returns_conflict_with_revision_details(
+    api_client,
+    tmp_path,
+):
+    client, _ = api_client
+    incident_repository = SQLiteIncidentRepository(tmp_path / "registry.sqlite3")
+    incident = make_api_incident("stale-revision-incident")
+    store_api_incident(incident_repository, incident)
+
+    response = client.patch(
+        f"/incidents/{incident.incident_id}/status",
+        json={
+            "status": IncidentStatus.ACKNOWLEDGED.value,
+            "expected_revision": incident.revision + 1,
+            "reason": "Stale request.",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["expected_revision"] == incident.revision + 1
+    assert response.json()["detail"]["current_revision"] == incident.revision
+    assert incident_repository.get_incident(incident.incident_id) == incident
+    assert incident_repository.list_status_history(incident.incident_id) == []
+
+
+@pytest.mark.parametrize(
+    ("parameter", "value"),
+    [
+        ("dataset_id", " "),
+        ("code", " "),
+        ("status", "UNKNOWN"),
+        ("severity", "urgent"),
+        ("limit", 0),
+        ("limit", 101),
+        ("offset", -1),
+    ],
+)
+def test_list_incidents_rejects_invalid_filters_and_pagination(
+    api_client,
+    parameter,
+    value,
+):
+    client, _ = api_client
+
+    response = client.get("/incidents", params={parameter: value})
+
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {
+            "status": "UNKNOWN",
+            "expected_revision": 1,
+            "reason": "Invalid status.",
+        },
+        {
+            "status": "ACKNOWLEDGED",
+            "expected_revision": 0,
+            "reason": "Invalid revision.",
+        },
+        {
+            "status": "ACKNOWLEDGED",
+            "expected_revision": -1,
+            "reason": "Negative revision.",
+        },
+        {
+            "status": "ACKNOWLEDGED",
+            "expected_revision": True,
+            "reason": "Boolean revision.",
+        },
+        {
+            "status": "ACKNOWLEDGED",
+            "expected_revision": "1",
+            "reason": "String revision.",
+        },
+        {
+            "status": "ACKNOWLEDGED",
+            "expected_revision": 1,
+            "reason": " \t ",
+        },
+        {
+            "status": "ACKNOWLEDGED",
+            "expected_revision": 1,
+        },
+        {
+            "status": "ACKNOWLEDGED",
+            "expected_revision": 1,
+            "reason": "Client actor must not be trusted.",
+            "actor": "client-supplied",
+        },
+    ],
+)
+def test_patch_rejects_invalid_request_bodies(api_client, body):
+    client, _ = api_client
+
+    response = client.patch(
+        "/incidents/any-incident/status",
+        json=body,
+    )
+
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize(
+    ("resource", "params"),
+    [
+        ("occurrences", {"limit": 0}),
+        ("history", {"offset": -1}),
+    ],
+)
+def test_occurrence_and_history_endpoints_reject_invalid_pagination(
+    api_client,
+    resource,
+    params,
+):
+    client, _ = api_client
+
+    response = client.get(
+        f"/incidents/any-incident/{resource}",
+        params=params,
     )
 
     assert response.status_code == 422
