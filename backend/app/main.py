@@ -8,9 +8,26 @@ from pathlib import Path
 from typing import Annotated
 
 import anyio
-from fastapi import FastAPI, File, Form, Header, HTTPException, Query, UploadFile
+from fastapi import (
+    FastAPI,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+)
+from fastapi.encoders import jsonable_encoder
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.auth.repository import AuthRepository
+from app.auth.router import router as auth_router
+from app.auth.service import AuthService
+from app.auth.sqlite_repository import SQLiteAuthRepository
 from app.core.analysis_limits import AnalysisDimensionExceededError
 from app.datasets.repository import DatasetAnalysisRepository
 from app.datasets.service import DatasetAnalysisResult, DatasetAnalysisService
@@ -55,6 +72,27 @@ MAX_UPLOAD_SIZE = 10 * 1024 * 1024  # 10 MB
 _DATASET_ANALYSIS_SEMAPHORE = threading.BoundedSemaphore(1)
 
 
+def _resolve_auth_cookie_secure() -> bool:
+    """Resolve cookie security, allowing insecure cookies only in development."""
+    configured_value = os.environ.get("VIGIA_COOKIE_SECURE")
+    if configured_value is None:
+        return True
+
+    normalized_value = configured_value.strip().casefold()
+    if normalized_value in {"true", "1", "yes"}:
+        return True
+    if normalized_value not in {"false", "0", "no"}:
+        raise ValueError("VIGIA_COOKIE_SECURE must be a boolean value.")
+
+    environment = os.environ.get("VIGIA_ENV", "").strip().casefold()
+    if environment != "development":
+        raise ValueError(
+            "VIGIA_COOKIE_SECURE may be disabled only when "
+            "VIGIA_ENV=development."
+        )
+    return False
+
+
 def _process_dataset_analysis(
     file_content: bytes,
     filename: str,
@@ -86,11 +124,17 @@ def create_app(
     incident_repository: IncidentRepository | None = None,
     *,
     dataset_analysis_repository: DatasetAnalysisRepository | None = None,
+    auth_repository: AuthRepository | None = None,
 ) -> FastAPI:
     """Create the API and wire its application services."""
+    auth_cookie_secure = _resolve_auth_cookie_secure()
+    uses_default_business_repositories = (
+        repository is None and incident_repository is None
+    )
+    database_path: Path | None = None
     schema_registry_repository: SchemaRegistryRepository
     incident_persistence_repository: IncidentRepository
-    if repository is None and incident_repository is None:
+    if uses_default_business_repositories:
         if dataset_analysis_repository is not None:
             raise ValueError(
                 "repository and incident_repository must be provided together "
@@ -176,6 +220,55 @@ def create_app(
                     "Injected SQLite repositories must use the same busy timeout."
                 )
 
+    if auth_repository is None:
+        if not uses_default_business_repositories or database_path is None:
+            raise ValueError(
+                "auth_repository is required when injecting custom business "
+                "repositories."
+            )
+        auth_persistence_repository: AuthRepository = SQLiteAuthRepository(
+            database_path,
+            busy_timeout_ms=5000,
+        )
+    else:
+        auth_persistence_repository = auth_repository
+
+    if isinstance(auth_persistence_repository, SQLiteAuthRepository):
+        sqlite_business_repositories = (
+            (
+                schema_registry_repository,
+                SQLiteSchemaRegistryRepository,
+            ),
+            (
+                incident_persistence_repository,
+                SQLiteIncidentRepository,
+            ),
+            (
+                dataset_analysis_repository,
+                SQLiteDatasetAnalysisRepository,
+            ),
+        )
+        auth_database_path = Path(
+            auth_persistence_repository.database_path
+        ).resolve()
+        for business_repository, repository_type in sqlite_business_repositories:
+            if not isinstance(business_repository, repository_type):
+                continue
+            if (
+                Path(business_repository.database_path).resolve()
+                != auth_database_path
+            ):
+                raise ValueError(
+                    "Injected SQLite repositories must use the same database path."
+                )
+            if (
+                business_repository.busy_timeout_ms
+                != auth_persistence_repository.busy_timeout_ms
+            ):
+                raise ValueError(
+                    "Injected SQLite repositories must use the same busy timeout."
+                )
+
     schema_registry_service = SchemaRegistryService(schema_registry_repository)
     incident_service = IncidentService(incident_persistence_repository)
     incident_management_service = IncidentManagementService(
@@ -196,6 +289,27 @@ def create_app(
     app.state.dataset_analysis_service = dataset_analysis_service
     app.state.dataset_analysis_repository = dataset_analysis_repository
     app.state.incident_management_service = incident_management_service
+    app.state.auth_repository = auth_persistence_repository
+    app.state.auth_service = AuthService(auth_persistence_repository)
+    app.state.auth_cookie_secure = auth_cookie_secure
+    app.include_router(auth_router)
+
+    @app.exception_handler(RequestValidationError)
+    async def handle_request_validation_error(
+        request: Request,
+        exc: RequestValidationError,
+    ) -> JSONResponse:
+        if request.url.path != "/auth/login":
+            return await request_validation_exception_handler(request, exc)
+
+        errors = [
+            {key: value for key, value in error.items() if key != "input"}
+            for error in exc.errors()
+        ]
+        return JSONResponse(
+            status_code=422,
+            content={"detail": jsonable_encoder(errors)},
+        )
 
     @app.get("/")
     def root():

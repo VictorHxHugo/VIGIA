@@ -8,6 +8,7 @@ from httpx import ASGITransport, AsyncClient
 import pytest
 
 from app import main as main_module
+from app.auth.sqlite_repository import SQLiteAuthRepository
 from app.core.analysis_limits import MAX_ANALYSIS_COLUMNS
 from app.datasets.sqlite_repository import SQLiteDatasetAnalysisRepository
 from app.incidents.models import (
@@ -35,6 +36,7 @@ def api_client(tmp_path):
     app = create_app(
         repository=repository,
         incident_repository=incident_repository,
+        auth_repository=SQLiteAuthRepository(database_path),
     )
 
     with TestClient(app) as client:
@@ -438,6 +440,7 @@ def test_incidents_persist_across_app_instances_sharing_database(tmp_path):
     first_app = create_app(
         repository=first_schema_repository,
         incident_repository=first_incident_repository,
+        auth_repository=SQLiteAuthRepository(database_path),
     )
     with TestClient(first_app) as first_client:
         first_response = upload_csv(
@@ -455,6 +458,7 @@ def test_incidents_persist_across_app_instances_sharing_database(tmp_path):
     second_app = create_app(
         repository=second_schema_repository,
         incident_repository=second_incident_repository,
+        auth_repository=SQLiteAuthRepository(database_path),
     )
     with TestClient(second_app) as second_client:
         second_response = upload_csv(
@@ -483,6 +487,7 @@ def test_incident_persistence_failure_is_not_reported_as_success_and_retry_works
     app = create_app(
         repository=schema_repository,
         incident_repository=incident_repository,
+        auth_repository=SQLiteAuthRepository(database_path),
     )
     original_record_status_change = SQLiteIncidentUnitOfWork.record_status_change
     should_fail = True
@@ -543,6 +548,7 @@ def test_create_app_accepts_explicit_analysis_repository(tmp_path):
         repository=schema_repository,
         incident_repository=incident_repository,
         dataset_analysis_repository=analysis_repository,
+        auth_repository=SQLiteAuthRepository(database_path),
     )
 
     assert app.state.dataset_analysis_repository is analysis_repository
@@ -652,6 +658,7 @@ async def test_concurrent_analysis_returns_503_and_first_request_completes(
     first_app = create_app(
         repository=first_repository,
         incident_repository=first_incident_repository,
+        auth_repository=SQLiteAuthRepository(first_database_path),
     )
     second_database_path = tmp_path / "second-analysis.sqlite3"
     second_repository = SQLiteSchemaRegistryRepository(second_database_path)
@@ -659,6 +666,7 @@ async def test_concurrent_analysis_returns_503_and_first_request_completes(
     second_app = create_app(
         repository=second_repository,
         incident_repository=second_incident_repository,
+        auth_repository=SQLiteAuthRepository(second_database_path),
     )
     started = Event()
     release = Event()
@@ -758,6 +766,7 @@ async def test_cancelled_request_keeps_semaphore_until_worker_finishes(
     app = create_app(
         repository=repository,
         incident_repository=incident_repository,
+        auth_repository=SQLiteAuthRepository(database_path),
     )
     started = Event()
     release = Event()
@@ -870,6 +879,7 @@ def test_baseline_persists_across_application_instances(tmp_path):
     first_app = create_app(
         repository=first_repository,
         incident_repository=first_incident_repository,
+        auth_repository=SQLiteAuthRepository(database_path),
     )
 
     with TestClient(first_app) as first_client:
@@ -896,6 +906,7 @@ def test_baseline_persists_across_application_instances(tmp_path):
     second_app = create_app(
         repository=second_repository,
         incident_repository=second_incident_repository,
+        auth_repository=SQLiteAuthRepository(database_path),
     )
 
     with TestClient(second_app) as second_client:
