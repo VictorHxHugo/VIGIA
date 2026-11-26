@@ -3,6 +3,7 @@
 from app.schema_registry.repository import (
     Schema,
     SchemaRegistryRepository,
+    SchemaRegistryUnitOfWork,
     SchemaVersion,
 )
 
@@ -20,6 +21,15 @@ class SchemaRegistryService:
     ) -> tuple[SchemaVersion, bool]:
         """Return the dataset baseline, creating version one when absent."""
         return self._repository.get_or_create_initial(dataset_id, schema)
+
+    def get_or_create_baseline_in(
+        self,
+        unit_of_work: SchemaRegistryUnitOfWork,
+        dataset_id: str,
+        schema: Schema,
+    ) -> tuple[SchemaVersion, bool]:
+        """Return or create a baseline using a caller-managed transaction."""
+        return unit_of_work.get_or_create_initial(dataset_id, schema)
 
     def approve_schema(
         self,

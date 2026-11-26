@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 import pandas as pd
 
+from app.datasets.repository import DatasetAnalysisRepository
 from app.incidents.service import IncidentProcessingResult, IncidentService
 from app.quality.engine import analyze_dataset
 from app.quality.schemas import QualityIssue, QualityReport
@@ -30,9 +31,11 @@ class DatasetAnalysisService:
         self,
         schema_registry: SchemaRegistryService,
         incident_service: IncidentService,
+        analysis_repository: DatasetAnalysisRepository,
     ) -> None:
         self._schema_registry = schema_registry
         self._incident_service = incident_service
+        self._analysis_repository = analysis_repository
 
     def analyze(
         self,
@@ -49,25 +52,30 @@ class DatasetAnalysisService:
             for column in quality_report.columns
         }
 
-        baseline, baseline_created = self._schema_registry.get_or_create_baseline(
-            dataset_id,
-            current_schema,
-        )
+        with self._analysis_repository.transaction() as unit_of_work:
+            baseline, baseline_created = (
+                self._schema_registry.get_or_create_baseline_in(
+                    unit_of_work.schemas,
+                    dataset_id,
+                    current_schema,
+                )
+            )
 
-        schema_drift_issues = (
-            []
-            if baseline_created
-            else detect_schema_drift(df, baseline.schema)
-        )
-        all_issues = [
-            *quality_report.issues,
-            *schema_drift_issues,
-        ]
-        incident_processing = self._incident_service.process_issues(
-            dataset_id,
-            analysis_id,
-            all_issues,
-        )
+            schema_drift_issues = (
+                []
+                if baseline_created
+                else detect_schema_drift(df, baseline.schema)
+            )
+            all_issues = [
+                *quality_report.issues,
+                *schema_drift_issues,
+            ]
+            incident_processing = self._incident_service.process_issues_in(
+                unit_of_work.incidents,
+                dataset_id,
+                analysis_id,
+                all_issues,
+            )
 
         return DatasetAnalysisResult(
             quality_report=quality_report,

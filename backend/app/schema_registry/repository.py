@@ -43,6 +43,35 @@ class SchemaVersionConflictError(Exception):
         )
 
 
+class SchemaRegistryUnitOfWork(Protocol):
+    """Schema registry operations bound to an externally managed transaction."""
+
+    def get_current(self, dataset_id: str) -> SchemaVersion | None:
+        """Return the current schema version, or None when not registered."""
+        ...
+
+    def get_or_create_initial(
+        self,
+        dataset_id: str,
+        schema: Schema,
+    ) -> tuple[SchemaVersion, bool]:
+        """Return the current version or create version one."""
+        ...
+
+    def approve_schema(
+        self,
+        dataset_id: str,
+        schema: Schema,
+        expected_version: int,
+    ) -> SchemaVersion:
+        """Create a version if expected_version is still current."""
+        ...
+
+    def list_versions(self, dataset_id: str) -> list[SchemaVersion]:
+        """Return all schema versions in ascending version order."""
+        ...
+
+
 class SchemaRegistryRepository(Protocol):
     """Persistence operations required by the schema registry service."""
 

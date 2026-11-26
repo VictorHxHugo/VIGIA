@@ -38,6 +38,9 @@ The backend processes an analysis through these stages:
 5. The API returns the quality report, drift issues, baseline information, and
    incident-processing counts.
 
+For an analysis, baseline persistence and incident writes share one SQLite
+transaction; see [the architecture guide](docs/ARCHITECTURE.md) for details.
+
 The schema registry and incident repositories use SQLite. By default, they
 share `backend/data/schema_registry.sqlite3`; set `VIGIA_DATABASE_PATH` to use
 another database file.
@@ -192,7 +195,7 @@ python -m pytest
 
 `pytest.ini` configures `backend` as the Python import path and
 `backend/tests` as the test directory. The most recently reported full-suite
-run passed **222 tests**. This is a historical result, not a guarantee for every
+run passed **239 tests**. This is a historical result, not a guarantee for every
 checkout or environment.
 
 ## Current Limitations
@@ -205,8 +208,6 @@ checkout or environment.
 - SQLite is the current persistence backend; PostgreSQL is not implemented.
 - Docker and CI/CD workflows are not configured.
 - The collection APIs do not provide total-count pagination metadata.
-- Schema baseline creation and incident persistence are separate operations.
-  An incident-persistence failure can occur after a baseline has been stored.
 - Dataset freshness or stale-dataset detection is not implemented.
 
 ## Roadmap

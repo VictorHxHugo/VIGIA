@@ -77,12 +77,31 @@ the SQLite adapters do not support `:memory:` because they open connections
 per operation. Relative paths are resolved from the server process's current
 working directory, so an absolute path avoids ambiguity.
 
-The adapters create the database's parent directory when needed. SQLite writes
-use transactions; incident changes that update an incident and append history
-are committed or rolled back together. The dataset-analysis flow stores or
-retrieves the schema baseline before it processes incidents, so these two
-operations are not one cross-repository transaction. A later incident
-persistence failure can therefore occur after baseline creation.
+The adapters create the database's parent directory when needed. At application
+construction, `create_app()` initializes the schema and incident repositories,
+then composes them into one `SQLiteDatasetAnalysisRepository`. The SQLite
+aggregate validates matching database paths and busy timeouts when constructed.
+If a SQLite aggregate is injected, `create_app()` also checks those values
+against the repositories. It does not verify equivalent settings or atomicity
+guarantees for a custom aggregate. The aggregate is retained by the application
+and opens one connection per analysis.
+
+Each analysis runs baseline access or creation, schema-drift detection, and
+incident, occurrence, and status-history persistence in one transaction. The
+aggregate starts it with `BEGIN IMMEDIATE`, commits on success, and attempts
+rollback if the transaction body or commit fails while a transaction is still
+active. The SQLite repositories initialize their tables when constructed; the
+aggregate does not recreate them per request.
+
+The existing `create_app(repository=..., incident_repository=...)` injection
+remains available for a matching SQLite pair. A custom persistence
+implementation must also be supplied as
+`dataset_analysis_repository=...`; that aggregate must make the schema and
+incident UoWs share one transaction. If it is not supplied, the app rejects a
+non-SQLite pair rather than falling back to separate transactions. For a
+custom backend, its implementer is responsible for shared-transaction
+semantics; the app cannot verify them. PostgreSQL support is not currently
+implemented.
 
 ## Run tests
 
@@ -91,7 +110,7 @@ persistence failure can therefore occur after baseline creation.
 suite with:
 
 ```sh
-python -m pytest
+python -m pytest backend/tests -v
 ```
 
 Run one test module by passing its path:
@@ -99,23 +118,29 @@ Run one test module by passing its path:
 **Windows PowerShell**
 
 ```powershell
+python -m pytest backend\tests\test_dataset_analysis_repository.py
+python -m pytest backend\tests\test_dataset_analysis_service.py
 python -m pytest backend\tests\test_api.py
 ```
 
 **Unix-like systems**
 
 ```sh
+python -m pytest backend/tests/test_dataset_analysis_repository.py
+python -m pytest backend/tests/test_dataset_analysis_service.py
 python -m pytest backend/tests/test_api.py
 ```
 
-Other test modules cover CSV ingestion, dataset analysis, quality rules,
+Other test modules cover CSV ingestion, dataset analysis, the aggregate
+repository's shared connection and commit/rollback behavior, quality rules,
 numeric anomaly detection, schema drift and the schema registry, as well as
 incident models, persistence, services, and management.
 
 API tests use a `tmp_path`-backed SQLite database. The API fixture creates the
-schema-registry and incident repositories against the same temporary file, so
-tests do not need a shared developer database. Follow that pattern for tests
-that need persistence; keep unit tests isolated from the default local database.
+schema-registry and incident repositories against the same temporary file;
+`create_app()` composes their analysis aggregate. Tests do not need a shared
+developer database. Follow that pattern for tests that need persistence; keep
+unit tests isolated from the default local database.
 
 ## Backend organization
 
@@ -167,7 +192,7 @@ automated verification and avoid documenting unconfigured tooling as required.
 3. Add focused tests alongside the related test modules. Use temporary files
    for SQLite integration and persistence tests.
 4. Run the specific test module first, then run the full suite with
-   `python -m pytest` when appropriate.
+   `python -m pytest backend/tests -v` when appropriate.
 5. Review the API and documentation for any changed request, response,
    persistence, or error behavior.
 
@@ -181,6 +206,6 @@ automated verification and avoid documenting unconfigured tooling as required.
 - Docker and CI/CD workflows are not configured.
 - Incident collection responses do not include total-count pagination
   metadata.
-- Schema baseline persistence and incident processing are separate operations,
-  not one transaction.
+- Only the SQLite aggregate transaction is implemented; custom persistence
+  backends must provide their own aggregate.
 - No official Python support range is declared.

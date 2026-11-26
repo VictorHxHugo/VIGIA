@@ -51,6 +51,66 @@ class IncidentService:
         detected_at: datetime | None = None,
     ) -> IncidentProcessingResult:
         """Create or update incidents and record their occurrences atomically."""
+        (
+            prepared_issues,
+            execution_time,
+            detection_time,
+            ignored_count,
+        ) = self._prepare_issues(dataset_id, analysis_id, issues, detected_at)
+        if not prepared_issues:
+            return IncidentProcessingResult(
+                ignored_occurrence_count=ignored_count,
+            )
+
+        with self._repository.transaction() as unit_of_work:
+            return self._process_prepared_issues(
+                unit_of_work,
+                dataset_id,
+                analysis_id,
+                prepared_issues,
+                execution_time,
+                detection_time,
+                ignored_count,
+            )
+
+    def process_issues_in(
+        self,
+        unit_of_work: IncidentUnitOfWork,
+        dataset_id: str,
+        analysis_id: str,
+        issues: Sequence[QualityIssue],
+        *,
+        detected_at: datetime | None = None,
+    ) -> IncidentProcessingResult:
+        """Process issues using a caller-managed incident unit of work."""
+        (
+            prepared_issues,
+            execution_time,
+            detection_time,
+            ignored_count,
+        ) = self._prepare_issues(dataset_id, analysis_id, issues, detected_at)
+        return self._process_prepared_issues(
+            unit_of_work,
+            dataset_id,
+            analysis_id,
+            prepared_issues,
+            execution_time,
+            detection_time,
+            ignored_count,
+        )
+
+    def _prepare_issues(
+        self,
+        dataset_id: str,
+        analysis_id: str,
+        issues: Sequence[QualityIssue],
+        detected_at: datetime | None,
+    ) -> tuple[
+        list[tuple[QualityIssue, str, IncidentSeverity]],
+        datetime,
+        datetime,
+        int,
+    ]:
         self._validate_identifier(dataset_id, "dataset_id")
         self._validate_identifier(analysis_id, "analysis_id")
         issue_snapshot = self._validate_issues(issues)
@@ -79,6 +139,18 @@ class IncidentService:
                 (issue, fingerprint, self._convert_severity(issue.severity))
             )
 
+        return prepared_issues, execution_time, detection_time, ignored_count
+
+    def _process_prepared_issues(
+        self,
+        unit_of_work: IncidentUnitOfWork,
+        dataset_id: str,
+        analysis_id: str,
+        prepared_issues: list[tuple[QualityIssue, str, IncidentSeverity]],
+        execution_time: datetime,
+        detection_time: datetime,
+        ignored_count: int,
+    ) -> IncidentProcessingResult:
         if not prepared_issues:
             return IncidentProcessingResult(
                 ignored_occurrence_count=ignored_count,
@@ -88,79 +160,78 @@ class IncidentService:
         updated_count = 0
         reopened_count = 0
 
-        with self._repository.transaction() as unit_of_work:
-            for issue, fingerprint, severity in prepared_issues:
-                incident = unit_of_work.get_by_fingerprint(
-                    dataset_id,
-                    fingerprint,
-                )
-                if incident is None:
-                    self._create_incident(
-                        unit_of_work,
-                        issue,
-                        dataset_id,
-                        analysis_id,
-                        fingerprint,
-                        severity,
-                        detection_time,
-                    )
-                    created_count += 1
-                    continue
-
-                occurrence = self._make_occurrence(
+        for issue, fingerprint, severity in prepared_issues:
+            incident = unit_of_work.get_by_fingerprint(
+                dataset_id,
+                fingerprint,
+            )
+            if incident is None:
+                self._create_incident(
+                    unit_of_work,
                     issue,
-                    incident.incident_id,
+                    dataset_id,
                     analysis_id,
-                    detection_time,
+                    fingerprint,
                     severity,
+                    detection_time,
                 )
-                if not unit_of_work.record_occurrence(occurrence):
-                    ignored_count += 1
-                    continue
+                created_count += 1
+                continue
 
-                reopened = incident.status is IncidentStatus.RESOLVED
-                new_status = incident.status
-                resolved_at = incident.resolved_at
-                if reopened:
-                    validate_status_transition(
-                        incident.status,
-                        IncidentStatus.OPEN,
-                        automatic_reopen=True,
+            occurrence = self._make_occurrence(
+                issue,
+                incident.incident_id,
+                analysis_id,
+                detection_time,
+                severity,
+            )
+            if not unit_of_work.record_occurrence(occurrence):
+                ignored_count += 1
+                continue
+
+            reopened = incident.status is IncidentStatus.RESOLVED
+            new_status = incident.status
+            resolved_at = incident.resolved_at
+            if reopened:
+                validate_status_transition(
+                    incident.status,
+                    IncidentStatus.OPEN,
+                    automatic_reopen=True,
+                )
+                new_status = IncidentStatus.OPEN
+                resolved_at = None
+
+            updated_incident = replace(
+                incident,
+                title=issue.title,
+                description=issue.description,
+                severity=severity,
+                status=new_status,
+                updated_at=max(incident.updated_at, execution_time),
+                last_seen_at=max(incident.last_seen_at, detection_time),
+                resolved_at=resolved_at,
+                occurrence_count=incident.occurrence_count + 1,
+            )
+            unit_of_work.update_incident(
+                updated_incident,
+                expected_revision=incident.revision,
+            )
+
+            if reopened:
+                unit_of_work.record_status_change(
+                    IncidentStatusChange(
+                        change_id=self._new_id(),
+                        incident_id=incident.incident_id,
+                        from_status=IncidentStatus.RESOLVED,
+                        to_status=IncidentStatus.OPEN,
+                        changed_at=execution_time,
+                        actor=_SYSTEM_ACTOR,
+                        reason=_REOPEN_REASON,
                     )
-                    new_status = IncidentStatus.OPEN
-                    resolved_at = None
-
-                updated_incident = replace(
-                    incident,
-                    title=issue.title,
-                    description=issue.description,
-                    severity=severity,
-                    status=new_status,
-                    updated_at=max(incident.updated_at, execution_time),
-                    last_seen_at=max(incident.last_seen_at, detection_time),
-                    resolved_at=resolved_at,
-                    occurrence_count=incident.occurrence_count + 1,
                 )
-                unit_of_work.update_incident(
-                    updated_incident,
-                    expected_revision=incident.revision,
-                )
+                reopened_count += 1
 
-                if reopened:
-                    unit_of_work.record_status_change(
-                        IncidentStatusChange(
-                            change_id=self._new_id(),
-                            incident_id=incident.incident_id,
-                            from_status=IncidentStatus.RESOLVED,
-                            to_status=IncidentStatus.OPEN,
-                            changed_at=execution_time,
-                            actor=_SYSTEM_ACTOR,
-                            reason=_REOPEN_REASON,
-                        )
-                    )
-                    reopened_count += 1
-
-                updated_count += 1
+            updated_count += 1
 
         return IncidentProcessingResult(
             created_count=created_count,

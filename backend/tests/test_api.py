@@ -1,8 +1,10 @@
 from datetime import datetime, timedelta, timezone
+from typing import cast
 
 from fastapi.testclient import TestClient
 import pytest
 
+from app.datasets.sqlite_repository import SQLiteDatasetAnalysisRepository
 from app.incidents.models import (
     Incident,
     IncidentOccurrence,
@@ -10,9 +12,13 @@ from app.incidents.models import (
     IncidentStatus,
     IncidentStatusChange,
 )
-from app.incidents.repository import IncidentFilters
-from app.incidents.sqlite_repository import SQLiteIncidentRepository
+from app.incidents.repository import IncidentFilters, IncidentRepository
+from app.incidents.sqlite_repository import (
+    SQLiteIncidentRepository,
+    SQLiteIncidentUnitOfWork,
+)
 from app.main import MAX_UPLOAD_SIZE, create_app
+from app.schema_registry.repository import SchemaRegistryRepository
 from app.schema_registry.sqlite_repository import SQLiteSchemaRegistryRepository
 
 
@@ -433,17 +439,21 @@ def test_incident_persistence_failure_is_not_reported_as_success_and_retry_works
         repository=schema_repository,
         incident_repository=incident_repository,
     )
-    original_transaction = incident_repository.transaction
+    original_record_status_change = SQLiteIncidentUnitOfWork.record_status_change
     should_fail = True
 
-    def fail_once():
+    def fail_once(unit_of_work, change):
         nonlocal should_fail
         if should_fail:
             should_fail = False
             raise RuntimeError("Injected incident persistence failure.")
-        return original_transaction()
+        return original_record_status_change(unit_of_work, change)
 
-    monkeypatch.setattr(incident_repository, "transaction", fail_once)
+    monkeypatch.setattr(
+        SQLiteIncidentUnitOfWork,
+        "record_status_change",
+        fail_once,
+    )
 
     with TestClient(app) as client:
         failed_response = upload_csv(
@@ -452,6 +462,10 @@ def test_incident_persistence_failure_is_not_reported_as_success_and_retry_works
             b"id,name\n1,",
             idempotency_key="retry-after-persistence-failure",
         )
+        assert schema_repository.get_current("customers") is None
+        assert incident_repository.list_incidents(
+            IncidentFilters(dataset_id="customers")
+        ) == []
         retry_response = upload_csv(
             client,
             "customers",
@@ -468,6 +482,33 @@ def test_incident_persistence_failure_is_not_reported_as_success_and_retry_works
     )
     assert len(incidents) == 1
     assert incidents[0].occurrence_count == 1
+
+
+def test_create_app_accepts_explicit_analysis_repository(tmp_path):
+    database_path = tmp_path / "injected.sqlite3"
+    schema_repository = SQLiteSchemaRegistryRepository(database_path)
+    incident_repository = SQLiteIncidentRepository(database_path)
+    analysis_repository = SQLiteDatasetAnalysisRepository(
+        database_path,
+        schema_repository,
+        incident_repository,
+    )
+
+    app = create_app(
+        repository=schema_repository,
+        incident_repository=incident_repository,
+        dataset_analysis_repository=analysis_repository,
+    )
+
+    assert app.state.dataset_analysis_repository is analysis_repository
+
+
+def test_create_app_requires_aggregate_for_non_sqlite_repositories():
+    with pytest.raises(ValueError, match="dataset_analysis_repository is required"):
+        create_app(
+            repository=cast(SchemaRegistryRepository, object()),
+            incident_repository=cast(IncidentRepository, object()),
+        )
 
 
 def test_analyze_rejects_missing_dataset_id(api_client):

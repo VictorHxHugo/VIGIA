@@ -23,16 +23,82 @@ incident management endpoints.
 
 1. The dataset analysis API accepts a CSV upload and passes it to the ingestion
    module, which validates and reads it into a Pandas DataFrame.
-2. Dataset analysis coordinates quality checks, statistical anomaly analysis,
-   and schema handling.
-3. Quality analysis evaluates data quality and produces quality issues.
-   Numeric anomaly detection uses statistical analysis.
-4. The schema registry stores the first observed schema as a dataset baseline.
-   Later analyses compare the received schema with that baseline and report
-   schema drift. A new baseline version requires an explicit approval request.
-5. Quality and schema drift issues are processed as incidents. Incident data,
-   occurrences, and status history are persisted in SQLite and exposed through
-   the incident API, which supports filters, pagination, and status changes.
+2. Dataset analysis builds the quality report and derives the current schema.
+   Numeric anomaly detection is part of the quality analysis.
+3. `DatasetAnalysisService` opens one `DatasetAnalysisRepository.transaction()`
+   and uses its `DatasetAnalysisUnitOfWork` for the persistence-dependent part
+   of the analysis.
+4. Through `unit_of_work.schemas`, the service creates or retrieves the schema
+   baseline. It compares the upload with that baseline to detect drift, then
+   combines drift and quality issues.
+5. Through `unit_of_work.incidents`, the incident service creates or updates
+   incidents and records occurrences and status history. On success, the
+   aggregate commits the transaction. An exception during drift detection or
+   incident processing causes the aggregate to roll back the analysis writes.
+6. The API returns the quality report, drift issues, baseline information, and
+   incident-processing counts.
+
+## Atomic Dataset Analysis
+
+`DatasetAnalysisRepository` defines the transaction boundary for one analysis.
+Its `transaction()` yields a `DatasetAnalysisUnitOfWork` with two interfaces:
+`schemas` implements `SchemaRegistryUnitOfWork`, and `incidents` implements
+`IncidentUnitOfWork`. The dataset service passes these UoWs to the schema and
+incident services; those services do not start, commit, or roll back a
+transaction in this path.
+
+`SQLiteDatasetAnalysisRepository` opens a single SQLite connection for the
+analysis, configures its row factory and required PRAGMAs, and executes
+`BEGIN IMMEDIATE`. It constructs `SQLiteSchemaRegistryUnitOfWork` and
+`SQLiteIncidentUnitOfWork` with that exact connection. The aggregate commits
+after a successful context body. If `BEGIN IMMEDIATE` fails, it attempts
+rollback if a transaction is still active and calls `close()` in the `finally`
+block. If the context body or commit fails, it likewise attempts rollback only
+while a transaction remains active; it does not guarantee rollback in every
+failure scenario. The code calls `close()` in `finally` on every path, but
+successful closure is not guaranteed if `close()` itself raises an exception.
+Schema and incident repositories initialize their own tables when constructed;
+the aggregate reuses those tables and does not repeat their DDL per analysis.
+
+Baseline creation, drift detection based on that baseline, and incident,
+occurrence, and status-history writes all participate in this transaction.
+If a later operation fails, the aggregate attempts rollback while a transaction
+is still active. The analysis writes are atomic only if that rollback succeeds;
+if rollback fails, partial writes may remain.
+
+The services retain their independent operations:
+
+- `SchemaRegistryService.get_or_create_baseline()` uses the schema repository's
+  independent operation. `get_or_create_baseline_in()` instead requires an
+  external `SchemaRegistryUnitOfWork` and performs no transaction management.
+- `IncidentService.process_issues()` uses the incident repository's independent
+  transaction when preparation produces issues to process. That transaction is
+  already open even if occurrence deduplication later discards all of them. If
+  preparation produces no issues, the method can return without opening a
+  transaction. `process_issues_in()` requires an external `IncidentUnitOfWork`
+  and shares its business rules without opening or closing a transaction.
+
+### Application composition
+
+`create_app()` constructs the schema and incident SQLite repositories against
+the same configured database path, then creates one
+`SQLiteDatasetAnalysisRepository` with their path and busy timeout. This
+aggregate is constructed once with the application, not once per request.
+When a matching pair of SQLite repositories is injected, `create_app()` can
+construct the aggregate for them or accept it through the optional
+`dataset_analysis_repository` argument. `SQLiteDatasetAnalysisRepository`
+validates that repository paths and busy timeouts match when it is constructed.
+If a SQLite aggregate is injected, `create_app()` also checks those values
+against the repositories. It does not verify equivalent settings or transaction
+guarantees for a custom aggregate.
+
+Custom schema and incident repositories must be supplied together. They must
+also be accompanied by a custom `DatasetAnalysisRepository` that provides
+atomic shared-transaction behavior for their backend. There is no fallback to
+the two independent repository transactions when such an aggregate is absent.
+The custom aggregate's implementer is responsible for ensuring the schema and
+incident UoWs use the same transaction; `create_app()` cannot infer that
+backend-specific guarantee from the general repository Protocols.
 
 The incident API's status-change request uses revision checking. The API does
 not currently authenticate users; it supplies the internal actor label
@@ -98,8 +164,10 @@ local persistence directory, not a checked-in database requirement.
 
 - `frontend/` is a placeholder; no frontend application is implemented.
 - Authentication and authorization are not implemented.
-- SQLite is the only implemented persistence backend.
-- PostgreSQL support, Docker workflows, and CI/CD are not implemented.
+- SQLite is the only implemented persistence backend. The aggregate
+  transaction currently has a SQLite implementation; PostgreSQL is not
+  implemented.
+- Docker workflows and CI/CD are not implemented.
 - Stale-dataset detection is not implemented.
 
 ## Roadmap

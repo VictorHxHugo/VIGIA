@@ -9,7 +9,9 @@ from typing import Annotated
 from fastapi import FastAPI, File, Form, Header, HTTPException, Query, UploadFile
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.datasets.repository import DatasetAnalysisRepository
 from app.datasets.service import DatasetAnalysisService
+from app.datasets.sqlite_repository import SQLiteDatasetAnalysisRepository
 from app.incidents.api_schemas import (
     IncidentCollectionResponse,
     IncidentOccurrenceCollectionResponse,
@@ -61,11 +63,19 @@ class SchemaApprovalRequest(BaseModel):
 def create_app(
     repository: SchemaRegistryRepository | None = None,
     incident_repository: IncidentRepository | None = None,
+    *,
+    dataset_analysis_repository: DatasetAnalysisRepository | None = None,
 ) -> FastAPI:
     """Create the API and wire its application services."""
     schema_registry_repository: SchemaRegistryRepository
     incident_persistence_repository: IncidentRepository
     if repository is None and incident_repository is None:
+        if dataset_analysis_repository is not None:
+            raise ValueError(
+                "repository and incident_repository must be provided together "
+                "when injecting dataset_analysis_repository."
+            )
+
         configured_path = os.environ.get("VIGIA_DATABASE_PATH")
         if configured_path is not None and not configured_path.strip():
             raise ValueError("VIGIA_DATABASE_PATH must not be empty.")
@@ -79,6 +89,12 @@ def create_app(
         )
         schema_registry_repository = SQLiteSchemaRegistryRepository(database_path)
         incident_persistence_repository = SQLiteIncidentRepository(database_path)
+        dataset_analysis_repository = SQLiteDatasetAnalysisRepository(
+            database_path,
+            schema_registry_repository,
+            incident_persistence_repository,
+            busy_timeout_ms=schema_registry_repository.busy_timeout_ms,
+        )
     elif repository is None or incident_repository is None:
         raise ValueError(
             "repository and incident_repository must be provided together."
@@ -86,6 +102,58 @@ def create_app(
     else:
         schema_registry_repository = repository
         incident_persistence_repository = incident_repository
+        if dataset_analysis_repository is None:
+            if not isinstance(
+                schema_registry_repository,
+                SQLiteSchemaRegistryRepository,
+            ) or not isinstance(
+                incident_persistence_repository,
+                SQLiteIncidentRepository,
+            ):
+                raise ValueError(
+                    "dataset_analysis_repository is required when injected "
+                    "repositories are not SQLite repositories."
+                )
+            dataset_analysis_repository = SQLiteDatasetAnalysisRepository(
+                schema_registry_repository.database_path,
+                schema_registry_repository,
+                incident_persistence_repository,
+                busy_timeout_ms=schema_registry_repository.busy_timeout_ms,
+            )
+        elif isinstance(
+            dataset_analysis_repository,
+            SQLiteDatasetAnalysisRepository,
+        ):
+            if not isinstance(
+                schema_registry_repository,
+                SQLiteSchemaRegistryRepository,
+            ) or not isinstance(
+                incident_persistence_repository,
+                SQLiteIncidentRepository,
+            ):
+                raise ValueError(
+                    "A SQLite dataset analysis repository requires SQLite "
+                    "schema and incident repositories."
+                )
+            analysis_path = Path(dataset_analysis_repository.database_path).resolve()
+            if (
+                Path(schema_registry_repository.database_path).resolve()
+                != analysis_path
+                or Path(incident_persistence_repository.database_path).resolve()
+                != analysis_path
+            ):
+                raise ValueError(
+                    "Injected SQLite repositories must use the same database path."
+                )
+            if (
+                schema_registry_repository.busy_timeout_ms
+                != dataset_analysis_repository.busy_timeout_ms
+                or incident_persistence_repository.busy_timeout_ms
+                != dataset_analysis_repository.busy_timeout_ms
+            ):
+                raise ValueError(
+                    "Injected SQLite repositories must use the same busy timeout."
+                )
 
     schema_registry_service = SchemaRegistryService(schema_registry_repository)
     incident_service = IncidentService(incident_persistence_repository)
@@ -95,6 +163,7 @@ def create_app(
     dataset_analysis_service = DatasetAnalysisService(
         schema_registry_service,
         incident_service,
+        dataset_analysis_repository,
     )
 
     app = FastAPI(
@@ -104,6 +173,7 @@ def create_app(
     )
     app.state.schema_registry_service = schema_registry_service
     app.state.dataset_analysis_service = dataset_analysis_service
+    app.state.dataset_analysis_repository = dataset_analysis_repository
     app.state.incident_management_service = incident_management_service
 
     @app.get("/")

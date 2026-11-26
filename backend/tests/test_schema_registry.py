@@ -11,6 +11,7 @@ from app.schema_registry import (
     SQLiteSchemaRegistryRepository,
     SchemaVersionConflictError,
 )
+from app.schema_registry.sqlite_repository import SQLiteSchemaRegistryUnitOfWork
 
 
 def test_creates_initial_schema_version(tmp_path):
@@ -125,6 +126,115 @@ def test_approval_for_unknown_dataset_raises_not_found(tmp_path):
         )
 
 
+def test_unit_of_work_uses_external_transaction_without_managing_it(tmp_path):
+    database_path = tmp_path / "registry.sqlite3"
+    repository = SQLiteSchemaRegistryRepository(database_path)
+    connection = sqlite3.connect(database_path)
+    try:
+        connection.row_factory = sqlite3.Row
+        connection.execute("BEGIN IMMEDIATE")
+        unit_of_work = SQLiteSchemaRegistryUnitOfWork(connection)
+
+        assert unit_of_work.get_current("customers") is None
+
+        initial, created = unit_of_work.get_or_create_initial(
+            "customers",
+            {"id": "int64"},
+        )
+        approved = unit_of_work.approve_schema(
+            "customers",
+            {"id": "int64", "name": "object"},
+            expected_version=1,
+        )
+
+        assert created is True
+        assert initial.version == 1
+        assert unit_of_work.get_current("customers") == approved
+        assert unit_of_work.list_versions("customers") == [initial, approved]
+        assert connection.in_transaction is True
+        assert repository.get_current("customers") is None
+
+        connection.rollback()
+    finally:
+        connection.close()
+
+    assert repository.get_current("customers") is None
+    assert repository.list_versions("customers") == []
+
+
+def test_unit_of_work_leaves_failed_operation_rollback_to_caller(tmp_path):
+    database_path = tmp_path / "registry.sqlite3"
+    repository = SQLiteSchemaRegistryRepository(database_path)
+    initial, _ = repository.get_or_create_initial("customers", {"id": "int64"})
+    with closing(sqlite3.connect(database_path)) as setup_connection, setup_connection:
+        setup_connection.execute(
+            """
+            CREATE TRIGGER reject_second_version
+            BEFORE INSERT ON schema_versions
+            WHEN NEW.version = 2
+            BEGIN
+                SELECT RAISE(ABORT, 'forced insert failure');
+            END
+            """
+        )
+
+    connection = sqlite3.connect(database_path)
+    try:
+        connection.row_factory = sqlite3.Row
+        connection.execute("BEGIN IMMEDIATE")
+        unit_of_work = SQLiteSchemaRegistryUnitOfWork(connection)
+
+        with pytest.raises(sqlite3.IntegrityError, match="forced insert failure"):
+            unit_of_work.approve_schema(
+                "customers",
+                {"id": "int64", "name": "object"},
+                expected_version=1,
+            )
+
+        assert connection.in_transaction is True
+        assert unit_of_work.get_current("customers") is None
+        connection.rollback()
+    finally:
+        connection.close()
+
+    assert repository.get_current("customers") == initial
+
+
+def test_unit_of_work_does_not_change_connection_row_factory(tmp_path):
+    repository = SQLiteSchemaRegistryRepository(tmp_path / "registry.sqlite3")
+    connection = sqlite3.connect(repository.database_path)
+    original_row_factory = connection.row_factory
+    try:
+        SQLiteSchemaRegistryUnitOfWork(connection)
+
+        assert connection.row_factory is original_row_factory
+    finally:
+        connection.close()
+
+
+def test_independent_repository_validates_before_opening_connections(
+    tmp_path,
+    monkeypatch,
+):
+    repository = SQLiteSchemaRegistryRepository(tmp_path / "registry.sqlite3")
+
+    def fail_if_connection_is_opened():
+        pytest.fail("A connection was opened before input validation.")
+
+    monkeypatch.setattr(repository, "_connection", fail_if_connection_is_opened)
+
+    with pytest.raises(ValueError, match="dataset_id"):
+        repository.get_current("")
+    with pytest.raises(ValueError, match="dataset_id"):
+        repository.get_or_create_initial("", {"id": "int64"})
+    with pytest.raises(ValueError, match="data types"):
+        repository.get_or_create_initial("customers", {"id": ""})
+    with pytest.raises(ValueError, match="expected_version"):
+        repository.approve_schema("customers", {"id": "int64"}, 0)
+    with pytest.raises(ValueError, match="dataset_id"):
+        repository.list_versions("")
+
+
 def test_failed_approval_rolls_back_current_version_change(tmp_path):
     database_path = tmp_path / "registry.sqlite3"
     repository = SQLiteSchemaRegistryRepository(database_path)
@@ -222,6 +332,44 @@ def test_concurrent_initial_creation_keeps_one_baseline(tmp_path):
     assert current is not None
     assert current.version == 1
     assert len(repository.list_versions("customers")) == 1
+
+
+def test_concurrent_approvals_preserve_optimistic_version_conflicts(tmp_path):
+    repository = SQLiteSchemaRegistryRepository(
+        tmp_path / "registry.sqlite3",
+        busy_timeout_ms=10000,
+    )
+    repository.get_or_create_initial("customers", {"id": "int64"})
+    barrier = Barrier(2)
+
+    def approve(schema):
+        barrier.wait()
+        try:
+            return repository.approve_schema(
+                "customers",
+                schema,
+                expected_version=1,
+            )
+        except SchemaVersionConflictError as error:
+            return error
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(approve, {"id": "int64", "name": "object"}),
+            executor.submit(approve, {"id": "int64", "email": "object"}),
+        ]
+        results = [future.result() for future in futures]
+
+    assert sum(
+        isinstance(result, SchemaVersionConflictError) for result in results
+    ) == 1
+    assert sum(
+        not isinstance(result, SchemaVersionConflictError) for result in results
+    ) == 1
+    assert [version.version for version in repository.list_versions("customers")] == [
+        1,
+        2,
+    ]
 
 
 @pytest.mark.parametrize("dataset_id", ["", " customers", "customers "])

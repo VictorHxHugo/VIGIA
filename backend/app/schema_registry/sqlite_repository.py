@@ -10,51 +10,24 @@ from pathlib import Path
 from app.schema_registry.repository import (
     DatasetNotFoundError,
     Schema,
+    SchemaRegistryUnitOfWork,
     SchemaVersion,
     SchemaVersionConflictError,
 )
 
 
-class SQLiteSchemaRegistryRepository:
-    """Store schema versions in a file-backed SQLite database."""
+class SQLiteSchemaRegistryUnitOfWork(SchemaRegistryUnitOfWork):
+    """Schema registry operations using a caller-owned SQLite connection."""
 
-    def __init__(
-        self,
-        database_path: str | Path,
-        busy_timeout_ms: int = 5000,
-    ) -> None:
-        if (
-            isinstance(busy_timeout_ms, bool)
-            or not isinstance(busy_timeout_ms, int)
-            or busy_timeout_ms < 0
-        ):
-            raise ValueError("busy_timeout_ms must be a non-negative integer.")
-
-        self.database_path = str(database_path)
-        if self.database_path == ":memory:":
-            raise ValueError(
-                "A file-backed database path is required because connections "
-                "are opened per operation."
-            )
-
-        self.busy_timeout_ms = busy_timeout_ms
-        Path(self.database_path).parent.mkdir(parents=True, exist_ok=True)
-        self._initialize_database()
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self._connection = connection
 
     def get_current(self, dataset_id: str) -> SchemaVersion | None:
-        """Return the current schema version for a dataset, if present."""
         self._validate_dataset_id(dataset_id)
+        return self._get_current(dataset_id)
 
-        with self._connection() as connection:
-            row = connection.execute(
-                """
-                SELECT dataset_id, version, schema_json, created_at
-                FROM schema_versions
-                WHERE dataset_id = ? AND is_current = 1
-                """,
-                (dataset_id,),
-            ).fetchone()
-
+    def _get_current(self, dataset_id: str) -> SchemaVersion | None:
+        row = self._get_current_row(dataset_id)
         return self._row_to_schema_version(row) if row is not None else None
 
     def get_or_create_initial(
@@ -62,34 +35,38 @@ class SQLiteSchemaRegistryRepository:
         dataset_id: str,
         schema: Schema,
     ) -> tuple[SchemaVersion, bool]:
-        """Return the baseline or atomically create it as version one."""
         self._validate_dataset_id(dataset_id)
         schema_json = self._serialize_schema(schema)
+        return self._get_or_create_initial(dataset_id, schema_json)
 
-        with self._write_transaction() as connection:
-            row = self._get_current_row(connection, dataset_id)
-            if row is not None:
-                return self._row_to_schema_version(row), False
+    def _get_or_create_initial(
+        self,
+        dataset_id: str,
+        schema_json: str,
+    ) -> tuple[SchemaVersion, bool]:
+        row = self._get_current_row(dataset_id)
+        if row is not None:
+            return self._row_to_schema_version(row), False
 
-            created_at = self._utc_now()
-            connection.execute(
-                """
-                INSERT INTO schema_versions (
-                    dataset_id,
-                    version,
-                    schema_json,
-                    created_at,
-                    is_current
-                )
-                VALUES (?, 1, ?, ?, 1)
-                """,
-                (dataset_id, schema_json, created_at),
+        created_at = self._utc_now()
+        self._connection.execute(
+            """
+            INSERT INTO schema_versions (
+                dataset_id,
+                version,
+                schema_json,
+                created_at,
+                is_current
             )
-            row = self._get_current_row(connection, dataset_id)
-            if row is None:
-                raise RuntimeError("The initial schema version was not stored.")
+            VALUES (?, 1, ?, ?, 1)
+            """,
+            (dataset_id, schema_json, created_at),
+        )
+        row = self._get_current_row(dataset_id)
+        if row is None:
+            raise RuntimeError("The initial schema version was not stored.")
 
-            return self._row_to_schema_version(row), True
+        return self._row_to_schema_version(row), True
 
     def approve_schema(
         self,
@@ -97,137 +74,83 @@ class SQLiteSchemaRegistryRepository:
         schema: Schema,
         expected_version: int,
     ) -> SchemaVersion:
-        """Atomically append a schema version when the expected version is current."""
         self._validate_dataset_id(dataset_id)
         self._validate_expected_version(expected_version)
         schema_json = self._serialize_schema(schema)
+        return self._approve_schema(dataset_id, schema_json, expected_version)
 
-        with self._write_transaction() as connection:
-            current_row = self._get_current_row(connection, dataset_id)
-            if current_row is None:
-                raise DatasetNotFoundError(dataset_id)
+    def _approve_schema(
+        self,
+        dataset_id: str,
+        schema_json: str,
+        expected_version: int,
+    ) -> SchemaVersion:
+        current_row = self._get_current_row(dataset_id)
+        if current_row is None:
+            raise DatasetNotFoundError(dataset_id)
 
-            current = self._row_to_schema_version(current_row)
-            if current.version != expected_version:
-                raise SchemaVersionConflictError(
-                    dataset_id,
-                    expected_version,
-                    current.version,
-                )
-
-            next_version = current.version + 1
-            result = connection.execute(
-                """
-                UPDATE schema_versions
-                SET is_current = 0
-                WHERE dataset_id = ? AND version = ? AND is_current = 1
-                """,
-                (dataset_id, current.version),
+        current = self._row_to_schema_version(current_row)
+        if current.version != expected_version:
+            raise SchemaVersionConflictError(
+                dataset_id,
+                expected_version,
+                current.version,
             )
-            if result.rowcount != 1:
-                raise SchemaVersionConflictError(
-                    dataset_id,
-                    expected_version,
-                    current.version,
-                )
 
-            created_at = self._utc_now()
-            connection.execute(
-                """
-                INSERT INTO schema_versions (
-                    dataset_id,
-                    version,
-                    schema_json,
-                    created_at,
-                    is_current
-                )
-                VALUES (?, ?, ?, ?, 1)
-                """,
-                (dataset_id, next_version, schema_json, created_at),
+        next_version = current.version + 1
+        result = self._connection.execute(
+            """
+            UPDATE schema_versions
+            SET is_current = 0
+            WHERE dataset_id = ? AND version = ? AND is_current = 1
+            """,
+            (dataset_id, current.version),
+        )
+        if result.rowcount != 1:
+            raise SchemaVersionConflictError(
+                dataset_id,
+                expected_version,
+                current.version,
             )
-            row = self._get_current_row(connection, dataset_id)
-            if row is None:
-                raise RuntimeError("The approved schema version was not stored.")
 
-            return self._row_to_schema_version(row)
+        created_at = self._utc_now()
+        self._connection.execute(
+            """
+            INSERT INTO schema_versions (
+                dataset_id,
+                version,
+                schema_json,
+                created_at,
+                is_current
+            )
+            VALUES (?, ?, ?, ?, 1)
+            """,
+            (dataset_id, next_version, schema_json, created_at),
+        )
+        row = self._get_current_row(dataset_id)
+        if row is None:
+            raise RuntimeError("The approved schema version was not stored.")
+
+        return self._row_to_schema_version(row)
 
     def list_versions(self, dataset_id: str) -> list[SchemaVersion]:
-        """Return a dataset's schema history in ascending version order."""
         self._validate_dataset_id(dataset_id)
+        return self._list_versions(dataset_id)
 
-        with self._connection() as connection:
-            rows = connection.execute(
-                """
-                SELECT dataset_id, version, schema_json, created_at
-                FROM schema_versions
-                WHERE dataset_id = ?
-                ORDER BY version ASC
-                """,
-                (dataset_id,),
-            ).fetchall()
-
+    def _list_versions(self, dataset_id: str) -> list[SchemaVersion]:
+        rows = self._connection.execute(
+            """
+            SELECT dataset_id, version, schema_json, created_at
+            FROM schema_versions
+            WHERE dataset_id = ?
+            ORDER BY version ASC
+            """,
+            (dataset_id,),
+        ).fetchall()
         return [self._row_to_schema_version(row) for row in rows]
 
-    def _initialize_database(self) -> None:
-        with self._connection() as connection:
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS schema_versions (
-                    dataset_id TEXT NOT NULL
-                        CHECK (length(trim(dataset_id)) > 0),
-                    version INTEGER NOT NULL
-                        CHECK (version >= 1),
-                    schema_json TEXT NOT NULL
-                        CHECK (json_valid(schema_json)),
-                    created_at TEXT NOT NULL
-                        CHECK (length(created_at) > 0),
-                    is_current INTEGER NOT NULL
-                        CHECK (is_current IN (0, 1)),
-                    PRIMARY KEY (dataset_id, version)
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE UNIQUE INDEX IF NOT EXISTS
-                    uq_schema_versions_one_current
-                ON schema_versions (dataset_id)
-                WHERE is_current = 1
-                """
-            )
-            connection.commit()
-
-    @contextmanager
-    def _connection(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(
-            self.database_path,
-            timeout=self.busy_timeout_ms / 1000,
-        )
-        try:
-            connection.row_factory = sqlite3.Row
-            connection.execute(f"PRAGMA busy_timeout = {self.busy_timeout_ms}")
-            yield connection
-        finally:
-            connection.close()
-
-    @contextmanager
-    def _write_transaction(self) -> Iterator[sqlite3.Connection]:
-        with self._connection() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            try:
-                yield connection
-                connection.commit()
-            except Exception:
-                if connection.in_transaction:
-                    connection.rollback()
-                raise
-
-    @staticmethod
-    def _get_current_row(
-        connection: sqlite3.Connection,
-        dataset_id: str,
-    ) -> sqlite3.Row | None:
-        return connection.execute(
+    def _get_current_row(self, dataset_id: str) -> sqlite3.Row | None:
+        return self._connection.execute(
             """
             SELECT dataset_id, version, schema_json, created_at
             FROM schema_versions
@@ -237,10 +160,7 @@ class SQLiteSchemaRegistryRepository:
         ).fetchone()
 
     @classmethod
-    def _row_to_schema_version(
-        cls,
-        row: sqlite3.Row,
-    ) -> SchemaVersion:
+    def _row_to_schema_version(cls, row: sqlite3.Row) -> SchemaVersion:
         try:
             schema = json.loads(row["schema_json"])
         except json.JSONDecodeError as exc:
@@ -296,3 +216,129 @@ class SQLiteSchemaRegistryRepository:
     @staticmethod
     def _utc_now() -> str:
         return datetime.now(timezone.utc).isoformat()
+
+
+class SQLiteSchemaRegistryRepository:
+    """Store schema versions in a file-backed SQLite database."""
+
+    def __init__(
+        self,
+        database_path: str | Path,
+        busy_timeout_ms: int = 5000,
+    ) -> None:
+        if (
+            isinstance(busy_timeout_ms, bool)
+            or not isinstance(busy_timeout_ms, int)
+            or busy_timeout_ms < 0
+        ):
+            raise ValueError("busy_timeout_ms must be a non-negative integer.")
+
+        self.database_path = str(database_path)
+        if self.database_path == ":memory:":
+            raise ValueError(
+                "A file-backed database path is required because connections "
+                "are opened per operation."
+            )
+
+        self.busy_timeout_ms = busy_timeout_ms
+        Path(self.database_path).parent.mkdir(parents=True, exist_ok=True)
+        self._initialize_database()
+
+    def get_current(self, dataset_id: str) -> SchemaVersion | None:
+        """Return the current schema version for a dataset, if present."""
+        SQLiteSchemaRegistryUnitOfWork._validate_dataset_id(dataset_id)
+        with self._connection() as connection:
+            return SQLiteSchemaRegistryUnitOfWork(connection)._get_current(dataset_id)
+
+    def get_or_create_initial(
+        self,
+        dataset_id: str,
+        schema: Schema,
+    ) -> tuple[SchemaVersion, bool]:
+        """Return the baseline or atomically create it as version one."""
+        SQLiteSchemaRegistryUnitOfWork._validate_dataset_id(dataset_id)
+        schema_json = SQLiteSchemaRegistryUnitOfWork._serialize_schema(schema)
+        with self._write_transaction() as connection:
+            return SQLiteSchemaRegistryUnitOfWork(connection)._get_or_create_initial(
+                dataset_id,
+                schema_json,
+            )
+
+    def approve_schema(
+        self,
+        dataset_id: str,
+        schema: Schema,
+        expected_version: int,
+    ) -> SchemaVersion:
+        """Atomically append a schema version when the expected version is current."""
+        SQLiteSchemaRegistryUnitOfWork._validate_dataset_id(dataset_id)
+        SQLiteSchemaRegistryUnitOfWork._validate_expected_version(expected_version)
+        schema_json = SQLiteSchemaRegistryUnitOfWork._serialize_schema(schema)
+        with self._write_transaction() as connection:
+            return SQLiteSchemaRegistryUnitOfWork(connection)._approve_schema(
+                dataset_id,
+                schema_json,
+                expected_version,
+            )
+
+    def list_versions(self, dataset_id: str) -> list[SchemaVersion]:
+        """Return a dataset's schema history in ascending version order."""
+        SQLiteSchemaRegistryUnitOfWork._validate_dataset_id(dataset_id)
+        with self._connection() as connection:
+            return SQLiteSchemaRegistryUnitOfWork(connection)._list_versions(
+                dataset_id
+            )
+
+    def _initialize_database(self) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS schema_versions (
+                    dataset_id TEXT NOT NULL
+                        CHECK (length(trim(dataset_id)) > 0),
+                    version INTEGER NOT NULL
+                        CHECK (version >= 1),
+                    schema_json TEXT NOT NULL
+                        CHECK (json_valid(schema_json)),
+                    created_at TEXT NOT NULL
+                        CHECK (length(created_at) > 0),
+                    is_current INTEGER NOT NULL
+                        CHECK (is_current IN (0, 1)),
+                    PRIMARY KEY (dataset_id, version)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS
+                    uq_schema_versions_one_current
+                ON schema_versions (dataset_id)
+                WHERE is_current = 1
+                """
+            )
+            connection.commit()
+
+    @contextmanager
+    def _connection(self) -> Iterator[sqlite3.Connection]:
+        connection = sqlite3.connect(
+            self.database_path,
+            timeout=self.busy_timeout_ms / 1000,
+        )
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute(f"PRAGMA busy_timeout = {self.busy_timeout_ms}")
+            yield connection
+        finally:
+            connection.close()
+
+    @contextmanager
+    def _write_transaction(self) -> Iterator[sqlite3.Connection]:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                yield connection
+                connection.commit()
+            except Exception:
+                if connection.in_transaction:
+                    connection.rollback()
+                raise

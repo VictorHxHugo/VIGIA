@@ -1,8 +1,10 @@
+import sqlite3
 from collections.abc import Sequence
 
 import pandas as pd
 import pytest
 
+from app.datasets.sqlite_repository import SQLiteDatasetAnalysisRepository
 from app.datasets.service import DatasetAnalysisService
 from app.incidents import (
     IncidentFilters,
@@ -22,7 +24,16 @@ def analysis_setup(tmp_path):
     incident_repository = SQLiteIncidentRepository(database_path)
     incident_service = IncidentService(incident_repository)
     registry_service = SchemaRegistryService(repository)
-    analysis_service = DatasetAnalysisService(registry_service, incident_service)
+    analysis_repository = SQLiteDatasetAnalysisRepository(
+        database_path,
+        repository,
+        incident_repository,
+    )
+    analysis_service = DatasetAnalysisService(
+        registry_service,
+        incident_service,
+        analysis_repository,
+    )
     return repository, registry_service, analysis_service, incident_repository
 
 
@@ -266,11 +277,14 @@ class RecordingIncidentService(IncidentService):
         self.error = error
         self.calls: list[tuple[str, str, list[QualityIssue]]] = []
 
-    def process_issues(
+    def process_issues_in(
         self,
+        unit_of_work,
         dataset_id: str,
         analysis_id: str,
         issues: Sequence[QualityIssue],
+        *,
+        detected_at=None,
     ) -> IncidentProcessingResult:
         self.calls.append((dataset_id, analysis_id, list(issues)))
         if self.error is not None:
@@ -278,13 +292,34 @@ class RecordingIncidentService(IncidentService):
         return self.result
 
 
+def make_analysis_service(
+    schema_repository,
+    incident_repository,
+    incident_service,
+):
+    analysis_repository = SQLiteDatasetAnalysisRepository(
+        schema_repository.database_path,
+        schema_repository,
+        incident_repository,
+        busy_timeout_ms=schema_repository.busy_timeout_ms,
+    )
+    return DatasetAnalysisService(
+        SchemaRegistryService(schema_repository),
+        incident_service,
+        analysis_repository,
+    )
+
+
 def test_initial_analysis_forwards_quality_issues_and_analysis_id(tmp_path):
-    repository = SQLiteSchemaRegistryRepository(tmp_path / "registry.sqlite3")
+    database_path = tmp_path / "registry.sqlite3"
+    repository = SQLiteSchemaRegistryRepository(database_path)
+    incident_repository = SQLiteIncidentRepository(database_path)
     incident_service = RecordingIncidentService(
         IncidentProcessingResult(created_count=1),
     )
-    analysis_service = DatasetAnalysisService(
-        SchemaRegistryService(repository),
+    analysis_service = make_analysis_service(
+        repository,
+        incident_repository,
         incident_service,
     )
 
@@ -306,10 +341,13 @@ def test_initial_analysis_forwards_quality_issues_and_analysis_id(tmp_path):
 def test_later_analysis_forwards_quality_and_schema_drift_without_field_loss(
     tmp_path,
 ):
-    repository = SQLiteSchemaRegistryRepository(tmp_path / "registry.sqlite3")
+    database_path = tmp_path / "registry.sqlite3"
+    repository = SQLiteSchemaRegistryRepository(database_path)
+    incident_repository = SQLiteIncidentRepository(database_path)
     incident_service = RecordingIncidentService()
-    analysis_service = DatasetAnalysisService(
-        SchemaRegistryService(repository),
+    analysis_service = make_analysis_service(
+        repository,
+        incident_repository,
         incident_service,
     )
     analysis_service.analyze(
@@ -358,7 +396,9 @@ def test_later_analysis_forwards_quality_and_schema_drift_without_field_loss(
 
 
 def test_analysis_exposes_incident_processing_counts(tmp_path):
-    repository = SQLiteSchemaRegistryRepository(tmp_path / "registry.sqlite3")
+    database_path = tmp_path / "registry.sqlite3"
+    repository = SQLiteSchemaRegistryRepository(database_path)
+    incident_repository = SQLiteIncidentRepository(database_path)
     processing_result = IncidentProcessingResult(
         created_count=2,
         updated_count=3,
@@ -366,8 +406,9 @@ def test_analysis_exposes_incident_processing_counts(tmp_path):
         ignored_occurrence_count=4,
     )
     incident_service = RecordingIncidentService(processing_result)
-    analysis_service = DatasetAnalysisService(
-        SchemaRegistryService(repository),
+    analysis_service = make_analysis_service(
+        repository,
+        incident_repository,
         incident_service,
     )
 
@@ -386,11 +427,14 @@ def test_analysis_exposes_incident_processing_counts(tmp_path):
 
 
 def test_incident_service_failure_is_propagated(tmp_path):
-    repository = SQLiteSchemaRegistryRepository(tmp_path / "registry.sqlite3")
+    database_path = tmp_path / "registry.sqlite3"
+    repository = SQLiteSchemaRegistryRepository(database_path)
+    incident_repository = SQLiteIncidentRepository(database_path)
     failure = RuntimeError("incident persistence failed")
     incident_service = RecordingIncidentService(error=failure)
-    analysis_service = DatasetAnalysisService(
-        SchemaRegistryService(repository),
+    analysis_service = make_analysis_service(
+        repository,
+        incident_repository,
         incident_service,
     )
 
@@ -403,13 +447,17 @@ def test_incident_service_failure_is_propagated(tmp_path):
         )
 
     assert error.value is failure
+    assert repository.get_current("customers") is None
 
 
 def test_analysis_without_issues_calls_incident_service_with_empty_sequence(tmp_path):
-    repository = SQLiteSchemaRegistryRepository(tmp_path / "registry.sqlite3")
+    database_path = tmp_path / "registry.sqlite3"
+    repository = SQLiteSchemaRegistryRepository(database_path)
+    incident_repository = SQLiteIncidentRepository(database_path)
     incident_service = RecordingIncidentService()
-    analysis_service = DatasetAnalysisService(
-        SchemaRegistryService(repository),
+    analysis_service = make_analysis_service(
+        repository,
+        incident_repository,
         incident_service,
     )
 
@@ -424,3 +472,114 @@ def test_analysis_without_issues_calls_incident_service_with_empty_sequence(tmp_
     assert result.schema_drift_issues == []
     assert incident_service.calls == [("customers", "analysis-1", [])]
     assert result.incident_processing == IncidentProcessingResult()
+
+
+def test_analysis_uses_shared_uow_and_persists_baseline_and_incidents(
+    tmp_path,
+    monkeypatch,
+):
+    database_path = tmp_path / "registry.sqlite3"
+    schema_repository = SQLiteSchemaRegistryRepository(database_path)
+    incident_repository = SQLiteIncidentRepository(database_path)
+    schema_service = SchemaRegistryService(schema_repository)
+    incident_service = IncidentService(incident_repository)
+    analysis_repository = SQLiteDatasetAnalysisRepository(
+        database_path,
+        schema_repository,
+        incident_repository,
+    )
+    analysis_service = DatasetAnalysisService(
+        schema_service,
+        incident_service,
+        analysis_repository,
+    )
+    observed_uows = {}
+    original_schema_operation = schema_service.get_or_create_baseline_in
+    original_incident_operation = incident_service.process_issues_in
+
+    def record_schema_uow(unit_of_work, dataset_id, schema):
+        observed_uows["schema"] = unit_of_work
+        return original_schema_operation(unit_of_work, dataset_id, schema)
+
+    def record_incident_uow(
+        unit_of_work,
+        dataset_id,
+        analysis_id,
+        issues,
+        *,
+        detected_at=None,
+    ):
+        observed_uows["incident"] = unit_of_work
+        return original_incident_operation(
+            unit_of_work,
+            dataset_id,
+            analysis_id,
+            issues,
+            detected_at=detected_at,
+        )
+
+    monkeypatch.setattr(
+        schema_service,
+        "get_or_create_baseline_in",
+        record_schema_uow,
+    )
+    monkeypatch.setattr(
+        incident_service,
+        "process_issues_in",
+        record_incident_uow,
+    )
+
+    result = analysis_service.analyze(
+        pd.DataFrame({"id": [1, None]}),
+        "customers",
+        "customers.csv",
+        analysis_id="atomic-analysis",
+    )
+
+    baseline = schema_repository.get_current("customers")
+    incidents = incident_repository.list_incidents(
+        IncidentFilters(dataset_id="customers")
+    )
+    assert baseline is not None
+    assert result.baseline_created is True
+    assert result.incident_processing.created_count > 0
+    assert incidents
+    assert observed_uows["schema"]._connection is observed_uows["incident"]._connection
+    assert len(incident_repository.list_occurrences(incidents[0].incident_id)) == 1
+
+
+def test_incident_history_failure_rolls_back_baseline_and_partial_incident_writes(
+    tmp_path,
+):
+    database_path = tmp_path / "registry.sqlite3"
+    schema_repository = SQLiteSchemaRegistryRepository(database_path)
+    incident_repository = SQLiteIncidentRepository(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            CREATE TRIGGER reject_initial_status_change
+            BEFORE INSERT ON incident_status_history
+            BEGIN
+                SELECT RAISE(ABORT, 'forced status history failure');
+            END
+            """
+        )
+
+    analysis_service = make_analysis_service(
+        schema_repository,
+        incident_repository,
+        IncidentService(incident_repository),
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="forced status history failure"):
+        analysis_service.analyze(
+            pd.DataFrame({"id": [1, None]}),
+            "customers",
+            "customers.csv",
+            analysis_id="failing-analysis",
+        )
+
+    assert schema_repository.get_current("customers") is None
+    assert incident_repository.list_incidents(
+        IncidentFilters(dataset_id="customers")
+    ) == []
