@@ -1,9 +1,12 @@
 import sqlite3
 from collections.abc import Sequence
 
+import numpy as np
 import pandas as pd
 import pytest
 
+import app.datasets.service as dataset_service_module
+from app.core.analysis_limits import AnalysisDimensionExceededError
 from app.datasets.sqlite_repository import SQLiteDatasetAnalysisRepository
 from app.datasets.service import DatasetAnalysisService
 from app.incidents import (
@@ -583,3 +586,72 @@ def test_incident_history_failure_rolls_back_baseline_and_partial_incident_write
     assert incident_repository.list_incidents(
         IncidentFilters(dataset_id="customers")
     ) == []
+
+
+@pytest.mark.parametrize(
+    ("dimension", "limit", "observed"),
+    [
+        ("columns", 200, 201),
+        ("rows", 100_000, 100_001),
+        ("cells", 2_000_000, 2_000_200),
+    ],
+)
+def test_excessive_dataframe_dimensions_fail_before_quality_or_transaction(
+    analysis_setup,
+    monkeypatch,
+    dimension: str,
+    limit: int,
+    observed: int,
+):
+    repository, _, analysis_service, incident_repository = analysis_setup
+    dataset_id = "oversized-dataset"
+    analysis_repository = analysis_service._analysis_repository
+
+    if dimension == "columns":
+        df = pd.DataFrame(
+            {f"column_{index}": [index] for index in range(observed)}
+        )
+    elif dimension == "rows":
+        df = pd.DataFrame({"value": range(observed)})
+    else:
+        df = pd.DataFrame(
+            np.zeros((10_001, 200), dtype=np.uint8)
+        )
+
+    def unexpected_quality_analysis(*args, **kwargs):
+        raise AssertionError("Quality analysis ran before dimension validation.")
+
+    def unexpected_transaction():
+        raise AssertionError("The aggregate transaction was opened.")
+
+    monkeypatch.setattr(
+        dataset_service_module,
+        "analyze_dataset",
+        unexpected_quality_analysis,
+    )
+    monkeypatch.setattr(
+        analysis_repository,
+        "transaction",
+        unexpected_transaction,
+    )
+
+    with pytest.raises(AnalysisDimensionExceededError) as exc_info:
+        analysis_service.analyze(
+            df,
+            dataset_id,
+            "oversized.csv",
+            analysis_id="oversized-analysis",
+        )
+
+    assert exc_info.value.dimension == dimension
+    assert exc_info.value.limit == limit
+    assert exc_info.value.observed == observed
+    assert repository.get_current(dataset_id) is None
+    assert incident_repository.list_incidents(
+        IncidentFilters(dataset_id=dataset_id)
+    ) == []
+    with sqlite3.connect(repository.database_path) as connection:
+        occurrence_count = connection.execute(
+            "SELECT COUNT(*) FROM incident_occurrences"
+        ).fetchone()[0]
+    assert occurrence_count == 0

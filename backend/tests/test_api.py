@@ -1,9 +1,14 @@
 from datetime import datetime, timedelta, timezone
+from threading import Event, Lock
 from typing import cast
 
+import anyio
 from fastapi.testclient import TestClient
+from httpx import ASGITransport, AsyncClient
 import pytest
 
+from app import main as main_module
+from app.core.analysis_limits import MAX_ANALYSIS_COLUMNS
 from app.datasets.sqlite_repository import SQLiteDatasetAnalysisRepository
 from app.incidents.models import (
     Incident,
@@ -49,6 +54,46 @@ def upload_csv(
         data={"dataset_id": dataset_id},
         files={"file": (filename, content, "text/csv")},
         headers={"Idempotency-Key": idempotency_key},
+    )
+
+
+async def upload_csv_async(
+    client: AsyncClient,
+    dataset_id: str,
+    content: bytes,
+    *,
+    idempotency_key: str,
+):
+    return await client.post(
+        "/datasets/analyze",
+        data={"dataset_id": dataset_id},
+        files={"file": ("customers.csv", content, "text/csv")},
+        headers={"Idempotency-Key": idempotency_key},
+    )
+
+
+def block_first_analysis(monkeypatch, started: Event, release: Event) -> None:
+    original_process = main_module._process_dataset_analysis
+    lock = Lock()
+    should_block = True
+
+    def blocked_process(*args, **kwargs):
+        nonlocal should_block
+        with lock:
+            block_this_call = should_block
+            should_block = False
+
+        if block_this_call:
+            started.set()
+            if not release.wait(timeout=10):
+                raise TimeoutError("Test did not release the blocked analysis.")
+
+        return original_process(*args, **kwargs)
+
+    monkeypatch.setattr(
+        main_module,
+        "_process_dataset_analysis",
+        blocked_process,
     )
 
 
@@ -576,6 +621,215 @@ def test_analyze_rejects_large_file(api_client):
     )
 
     assert response.status_code == 413
+
+
+def test_analyze_rejects_excessive_column_count_as_payload_too_large(api_client):
+    client, _ = api_client
+    header = ",".join(
+        f"column_{index}" for index in range(MAX_ANALYSIS_COLUMNS + 1)
+    )
+    row = ",".join("value" for _ in range(MAX_ANALYSIS_COLUMNS + 1))
+
+    response = upload_csv(
+        client,
+        "customers",
+        f"{header}\n{row}\n".encode(),
+        idempotency_key="too-many-columns",
+    )
+
+    assert response.status_code == 413
+    assert "columns" in response.json()["detail"]
+
+
+@pytest.mark.anyio
+async def test_concurrent_analysis_returns_503_and_first_request_completes(
+    tmp_path,
+    monkeypatch,
+):
+    first_database_path = tmp_path / "first-analysis.sqlite3"
+    first_repository = SQLiteSchemaRegistryRepository(first_database_path)
+    first_incident_repository = SQLiteIncidentRepository(first_database_path)
+    first_app = create_app(
+        repository=first_repository,
+        incident_repository=first_incident_repository,
+    )
+    second_database_path = tmp_path / "second-analysis.sqlite3"
+    second_repository = SQLiteSchemaRegistryRepository(second_database_path)
+    second_incident_repository = SQLiteIncidentRepository(second_database_path)
+    second_app = create_app(
+        repository=second_repository,
+        incident_repository=second_incident_repository,
+    )
+    started = Event()
+    release = Event()
+    block_first_analysis(monkeypatch, started, release)
+
+    first_transport = ASGITransport(app=first_app)
+    second_transport = ASGITransport(app=second_app)
+    async with AsyncClient(
+        transport=first_transport,
+        base_url="http://first",
+    ) as first_client, AsyncClient(
+        transport=second_transport,
+        base_url="http://second",
+    ) as second_client:
+        first_request_finished = anyio.Event()
+        first_response = []
+
+        async def send_first_request():
+            try:
+                first_response.append(
+                    await upload_csv_async(
+                        first_client,
+                        "customers",
+                        b"id,name\n1,Ana",
+                        idempotency_key="blocked-analysis",
+                    )
+                )
+            finally:
+                first_request_finished.set()
+
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(send_first_request)
+            try:
+                assert await anyio.to_thread.run_sync(started.wait, 5)
+                second_response = await upload_csv_async(
+                    second_client,
+                    "customers",
+                    b"id,name\n2,Bruno",
+                    idempotency_key="concurrent-analysis",
+                )
+            finally:
+                release.set()
+
+            await first_request_finished.wait()
+
+    assert second_response.status_code == 503
+    assert second_response.headers["Retry-After"] == "1"
+    assert first_response[0].status_code == 200
+
+
+def test_processing_exception_releases_analysis_semaphore(
+    api_client,
+    monkeypatch,
+):
+    client, _ = api_client
+    original_process = main_module._process_dataset_analysis
+    should_fail = True
+    lock = Lock()
+
+    def fail_once(*args, **kwargs):
+        nonlocal should_fail
+        with lock:
+            fail_this_call = should_fail
+            should_fail = False
+
+        if fail_this_call:
+            raise RuntimeError("Injected analysis processing failure.")
+        return original_process(*args, **kwargs)
+
+    monkeypatch.setattr(main_module, "_process_dataset_analysis", fail_once)
+
+    failed_response = upload_csv(
+        client,
+        "customers",
+        b"id,name\n1,Ana",
+        idempotency_key="analysis-fails-once",
+    )
+    retry_response = upload_csv(
+        client,
+        "customers",
+        b"id,name\n1,Ana",
+        idempotency_key="analysis-after-failure",
+    )
+
+    assert failed_response.status_code == 500
+    assert retry_response.status_code == 200
+
+
+@pytest.mark.anyio
+async def test_cancelled_request_keeps_semaphore_until_worker_finishes(
+    tmp_path,
+    monkeypatch,
+):
+    database_path = tmp_path / "cancelled-analysis.sqlite3"
+    repository = SQLiteSchemaRegistryRepository(database_path)
+    incident_repository = SQLiteIncidentRepository(database_path)
+    app = create_app(
+        repository=repository,
+        incident_repository=incident_repository,
+    )
+    started = Event()
+    release = Event()
+    block_first_analysis(monkeypatch, started, release)
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(
+        transport=transport,
+        base_url="http://test",
+    ) as client:
+        first_request_scope = anyio.CancelScope()
+        first_request_finished = anyio.Event()
+
+        async def send_first_request():
+            try:
+                with first_request_scope:
+                    await client.post(
+                        "/datasets/analyze",
+                        data={"dataset_id": "customers"},
+                        files={
+                            "file": (
+                                "customers.csv",
+                                b"id,name\n1,Ana",
+                                "text/csv",
+                            )
+                        },
+                        headers={"Idempotency-Key": "cancelled-analysis"},
+                    )
+            finally:
+                first_request_finished.set()
+
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(send_first_request)
+            try:
+                assert await anyio.to_thread.run_sync(started.wait, 5)
+                first_request_scope.cancel()
+
+                second_response = await client.post(
+                    "/datasets/analyze",
+                    data={"dataset_id": "customers"},
+                    files={
+                        "file": (
+                            "customers.csv",
+                            b"id,name\n2,Bruno",
+                            "text/csv",
+                        )
+                    },
+                    headers={"Idempotency-Key": "during-cancellation"},
+                )
+
+                assert second_response.status_code == 503
+                assert second_response.headers["Retry-After"] == "1"
+                assert not first_request_finished.is_set()
+            finally:
+                release.set()
+
+            await first_request_finished.wait()
+
+        after_completion = await client.post(
+            "/datasets/analyze",
+            data={"dataset_id": "customers"},
+            files={
+                "file": (
+                    "customers.csv",
+                    b"id,name\n3,Carlos",
+                    "text/csv",
+                )
+            },
+            headers={"Idempotency-Key": "after-cancellation"},
+        )
+
+    assert after_completion.status_code == 200
 
 
 def test_create_app_uses_configured_database_path(tmp_path, monkeypatch):

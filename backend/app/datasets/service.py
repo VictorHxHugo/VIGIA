@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 import pandas as pd
 
+from app.core.analysis_limits import validate_dataframe_dimensions
 from app.datasets.repository import DatasetAnalysisRepository
 from app.incidents.service import IncidentProcessingResult, IncidentService
 from app.quality.engine import analyze_dataset
@@ -46,6 +47,7 @@ class DatasetAnalysisService:
         analysis_id: str,
     ) -> DatasetAnalysisResult:
         """Analyze quality, report drift, and persist the detected issues."""
+        validate_dataframe_dimensions(df)
         quality_report = analyze_dataset(df, dataset_name)
         current_schema = {
             column.name: column.data_type

@@ -2,15 +2,18 @@
 
 import logging
 import os
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
 
+import anyio
 from fastapi import FastAPI, File, Form, Header, HTTPException, Query, UploadFile
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.core.analysis_limits import AnalysisDimensionExceededError
 from app.datasets.repository import DatasetAnalysisRepository
-from app.datasets.service import DatasetAnalysisService
+from app.datasets.service import DatasetAnalysisResult, DatasetAnalysisService
 from app.datasets.sqlite_repository import SQLiteDatasetAnalysisRepository
 from app.incidents.api_schemas import (
     IncidentCollectionResponse,
@@ -49,6 +52,24 @@ from app.schema_registry.sqlite_repository import SQLiteSchemaRegistryRepository
 logger = logging.getLogger(__name__)
 
 MAX_UPLOAD_SIZE = 10 * 1024 * 1024  # 10 MB
+_DATASET_ANALYSIS_SEMAPHORE = threading.BoundedSemaphore(1)
+
+
+def _process_dataset_analysis(
+    file_content: bytes,
+    filename: str,
+    dataset_id: str,
+    analysis_id: str,
+    analysis_service: DatasetAnalysisService,
+) -> DatasetAnalysisResult:
+    """Parse and analyze one upload synchronously in a worker thread."""
+    df = read_csv_file(file_content, filename)
+    return analysis_service.analyze(
+        df,
+        dataset_id=dataset_id,
+        dataset_name=filename,
+        analysis_id=analysis_id,
+    )
 
 
 class SchemaApprovalRequest(BaseModel):
@@ -385,6 +406,7 @@ def create_app(
         ],
     ):
         """Analyze a dataset; clients should reuse the key on communication retries."""
+        semaphore_acquired = False
         try:
             if (
                 not analysis_id
@@ -412,6 +434,14 @@ def create_app(
                     detail="Filename is required.",
                 )
 
+            if not _DATASET_ANALYSIS_SEMAPHORE.acquire(blocking=False):
+                raise HTTPException(
+                    status_code=503,
+                    detail="A dataset analysis is already in progress. Retry later.",
+                    headers={"Retry-After": "1"},
+                )
+            semaphore_acquired = True
+
             content = await file.read(MAX_UPLOAD_SIZE + 1)
 
             if len(content) > MAX_UPLOAD_SIZE:
@@ -420,12 +450,14 @@ def create_app(
                     detail="File exceeds the 10 MB upload limit.",
                 )
 
-            df = read_csv_file(content, file.filename)
-            result = app.state.dataset_analysis_service.analyze(
-                df,
-                dataset_id=dataset_id,
-                dataset_name=file.filename,
-                analysis_id=analysis_id,
+            result = await anyio.to_thread.run_sync(
+                _process_dataset_analysis,
+                content,
+                file.filename,
+                dataset_id,
+                analysis_id,
+                app.state.dataset_analysis_service,
+                abandon_on_cancel=False,
             )
 
             return {
@@ -446,6 +478,12 @@ def create_app(
                     ),
                 },
             }
+
+        except AnalysisDimensionExceededError as exc:
+            raise HTTPException(
+                status_code=413,
+                detail=str(exc),
+            ) from exc
 
         except CSVValidationError as exc:
             raise HTTPException(
@@ -470,7 +508,11 @@ def create_app(
             ) from exc
 
         finally:
-            await file.close()
+            try:
+                await file.close()
+            finally:
+                if semaphore_acquired:
+                    _DATASET_ANALYSIS_SEMAPHORE.release()
 
     @app.put("/datasets/{dataset_id}/schema")
     def approve_schema(
