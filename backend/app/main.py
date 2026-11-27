@@ -9,6 +9,7 @@ from typing import Annotated
 
 import anyio
 from fastapi import (
+    Depends,
     FastAPI,
     File,
     Form,
@@ -26,6 +27,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.auth.repository import AuthRepository
 from app.auth.router import router as auth_router
+from app.auth.dependencies import Permission, require_permission
+from app.auth.models import Principal
 from app.auth.service import AuthService
 from app.auth.sqlite_repository import SQLiteAuthRepository
 from app.core.analysis_limits import AnalysisDimensionExceededError
@@ -329,6 +332,10 @@ def create_app(
 
     @app.get("/incidents", response_model=IncidentCollectionResponse)
     def list_incidents(
+        principal: Annotated[
+            Principal,
+            Depends(require_permission(Permission.INCIDENT_READ)),
+        ],
         dataset_id: str | None = None,
         status: IncidentStatus | None = None,
         severity: IncidentSeverity | None = None,
@@ -371,6 +378,10 @@ def create_app(
     )
     def list_incident_occurrences(
         incident_id: str,
+        principal: Annotated[
+            Principal,
+            Depends(require_permission(Permission.INCIDENT_READ)),
+        ],
         limit: Annotated[int, Query(ge=1, le=100)] = 50,
         offset: Annotated[int, Query(ge=0)] = 0,
     ):
@@ -410,6 +421,10 @@ def create_app(
     )
     def list_incident_history(
         incident_id: str,
+        principal: Annotated[
+            Principal,
+            Depends(require_permission(Permission.INCIDENT_READ)),
+        ],
         limit: Annotated[int, Query(ge=1, le=100)] = 50,
         offset: Annotated[int, Query(ge=0)] = 0,
     ):
@@ -444,7 +459,13 @@ def create_app(
         }
 
     @app.get("/incidents/{incident_id}", response_model=IncidentResponse)
-    def get_incident(incident_id: str):
+    def get_incident(
+        incident_id: str,
+        principal: Annotated[
+            Principal,
+            Depends(require_permission(Permission.INCIDENT_READ)),
+        ],
+    ):
         if not incident_id.strip():
             raise HTTPException(
                 status_code=422,
@@ -469,6 +490,10 @@ def create_app(
     def change_incident_status(
         incident_id: str,
         request: IncidentStatusChangeRequest,
+        principal: Annotated[
+            Principal,
+            Depends(require_permission(Permission.INCIDENT_STATUS_CHANGE)),
+        ],
     ):
         if not incident_id.strip():
             raise HTTPException(
@@ -517,6 +542,10 @@ def create_app(
                     "a timeout or communication failure."
                 ),
             ),
+        ],
+        principal: Annotated[
+            Principal,
+            Depends(require_permission(Permission.DATASET_ANALYZE)),
         ],
     ):
         """Analyze a dataset; clients should reuse the key on communication retries."""
@@ -632,6 +661,10 @@ def create_app(
     def approve_schema(
         dataset_id: str,
         request: SchemaApprovalRequest,
+        principal: Annotated[
+            Principal,
+            Depends(require_permission(Permission.SCHEMA_APPROVE)),
+        ],
     ):
         """Administrative operation; do not expose publicly before authentication."""
         try:
@@ -661,7 +694,13 @@ def create_app(
         }
 
     @app.get("/datasets/{dataset_id}/schema/history")
-    def schema_history(dataset_id: str):
+    def schema_history(
+        dataset_id: str,
+        principal: Annotated[
+            Principal,
+            Depends(require_permission(Permission.SCHEMA_READ)),
+        ],
+    ):
         try:
             versions = app.state.schema_registry_service.list_versions(dataset_id)
         except ValueError as exc:

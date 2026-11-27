@@ -8,6 +8,8 @@ from httpx import ASGITransport, AsyncClient
 import pytest
 
 from app import main as main_module
+from app.auth.dependencies import SESSION_COOKIE_NAME
+from app.auth.models import UserRole
 from app.auth.sqlite_repository import SQLiteAuthRepository
 from app.core.analysis_limits import MAX_ANALYSIS_COLUMNS
 from app.datasets.sqlite_repository import SQLiteDatasetAnalysisRepository
@@ -38,9 +40,79 @@ def api_client(tmp_path):
         incident_repository=incident_repository,
         auth_repository=SQLiteAuthRepository(database_path),
     )
+    app.state.auth_service.create_user(
+        "api-admin",
+        "api-admin-password",
+        role=UserRole.ADMIN,
+    )
 
-    with TestClient(app) as client:
+    with TestClient(app, base_url="https://testserver") as client:
+        authenticated_session = app.state.auth_service.authenticate(
+            "api-admin",
+            "api-admin-password",
+        )
+        client.cookies.set(
+            SESSION_COOKIE_NAME,
+            authenticated_session.session_token,
+        )
         yield client, repository
+
+
+@pytest.fixture
+def authorization_api(tmp_path):
+    database_path = tmp_path / "authorization.sqlite3"
+    repository = SQLiteSchemaRegistryRepository(database_path)
+    incident_repository = SQLiteIncidentRepository(database_path)
+    app = create_app(
+        repository=repository,
+        incident_repository=incident_repository,
+        auth_repository=SQLiteAuthRepository(database_path),
+    )
+
+    passwords = {}
+    for role in (
+        UserRole.VIEWER,
+        UserRole.ANALYST,
+        UserRole.INCIDENT_OPERATOR,
+        UserRole.ADMIN,
+    ):
+        login = f"api-{role.value}"
+        password = f"{role.value}-password"
+        app.state.auth_service.create_user(login, password, role=role)
+        passwords[role] = (login, password)
+
+    with TestClient(app, base_url="https://testserver") as client:
+        yield app, client, repository, incident_repository, passwords
+
+
+def authenticate_api_role(app, client, role, passwords):
+    client.cookies.clear()
+    login, password = passwords[role]
+    authenticated_session = app.state.auth_service.authenticate(login, password)
+    client.cookies.set(
+        SESSION_COOKIE_NAME,
+        authenticated_session.session_token,
+    )
+    return authenticated_session
+
+
+def authenticate_admin(app, client, login="api-admin"):
+    password = f"{login}-password"
+    app.state.auth_service.create_user(
+        login,
+        password,
+        role=UserRole.ADMIN,
+    )
+    authenticated_session = app.state.auth_service.authenticate(
+        login,
+        password,
+    )
+    client.cookies.clear()
+    client.cookies.set(
+        SESSION_COOKIE_NAME,
+        authenticated_session.session_token,
+    )
+    return authenticated_session
 
 
 def upload_csv(
@@ -442,7 +514,8 @@ def test_incidents_persist_across_app_instances_sharing_database(tmp_path):
         incident_repository=first_incident_repository,
         auth_repository=SQLiteAuthRepository(database_path),
     )
-    with TestClient(first_app) as first_client:
+    with TestClient(first_app, base_url="https://testserver") as first_client:
+        authenticate_admin(first_app, first_client, "shared-first-admin")
         first_response = upload_csv(
             first_client,
             "customers",
@@ -460,7 +533,8 @@ def test_incidents_persist_across_app_instances_sharing_database(tmp_path):
         incident_repository=second_incident_repository,
         auth_repository=SQLiteAuthRepository(database_path),
     )
-    with TestClient(second_app) as second_client:
+    with TestClient(second_app, base_url="https://testserver") as second_client:
+        authenticate_admin(second_app, second_client, "shared-second-admin")
         second_response = upload_csv(
             second_client,
             "customers",
@@ -505,7 +579,8 @@ def test_incident_persistence_failure_is_not_reported_as_success_and_retry_works
         fail_once,
     )
 
-    with TestClient(app) as client:
+    with TestClient(app, base_url="https://testserver") as client:
+        authenticate_admin(app, client, "persistence-failure-admin")
         failed_response = upload_csv(
             client,
             "customers",
@@ -676,11 +751,37 @@ async def test_concurrent_analysis_returns_503_and_first_request_completes(
     second_transport = ASGITransport(app=second_app)
     async with AsyncClient(
         transport=first_transport,
-        base_url="http://first",
+        base_url="https://first",
     ) as first_client, AsyncClient(
         transport=second_transport,
-        base_url="http://second",
+        base_url="https://second",
     ) as second_client:
+        first_app.state.auth_service.create_user(
+            "concurrent-first-admin",
+            "concurrent-first-admin-password",
+            role=UserRole.ADMIN,
+        )
+        first_session = first_app.state.auth_service.authenticate(
+            "concurrent-first-admin",
+            "concurrent-first-admin-password",
+        )
+        first_client.cookies.set(
+            SESSION_COOKIE_NAME,
+            first_session.session_token,
+        )
+        second_app.state.auth_service.create_user(
+            "concurrent-second-admin",
+            "concurrent-second-admin-password",
+            role=UserRole.ADMIN,
+        )
+        second_session = second_app.state.auth_service.authenticate(
+            "concurrent-second-admin",
+            "concurrent-second-admin-password",
+        )
+        second_client.cookies.set(
+            SESSION_COOKIE_NAME,
+            second_session.session_token,
+        )
         first_request_finished = anyio.Event()
         first_response = []
 
@@ -775,8 +876,21 @@ async def test_cancelled_request_keeps_semaphore_until_worker_finishes(
 
     async with AsyncClient(
         transport=transport,
-        base_url="http://test",
+        base_url="https://test",
     ) as client:
+        app.state.auth_service.create_user(
+            "cancelled-analysis-admin",
+            "cancelled-analysis-admin-password",
+            role=UserRole.ADMIN,
+        )
+        authenticated_session = app.state.auth_service.authenticate(
+            "cancelled-analysis-admin",
+            "cancelled-analysis-admin-password",
+        )
+        client.cookies.set(
+            SESSION_COOKIE_NAME,
+            authenticated_session.session_token,
+        )
         first_request_scope = anyio.CancelScope()
         first_request_finished = anyio.Event()
 
@@ -846,7 +960,8 @@ def test_create_app_uses_configured_database_path(tmp_path, monkeypatch):
     monkeypatch.setenv("VIGIA_DATABASE_PATH", str(database_path))
 
     app = create_app()
-    with TestClient(app) as client:
+    with TestClient(app, base_url="https://testserver") as client:
+        authenticate_admin(app, client, "configured-path-admin")
         baseline_response = upload_csv(
             client,
             "customers",
@@ -882,7 +997,8 @@ def test_baseline_persists_across_application_instances(tmp_path):
         auth_repository=SQLiteAuthRepository(database_path),
     )
 
-    with TestClient(first_app) as first_client:
+    with TestClient(first_app, base_url="https://testserver") as first_client:
+        authenticate_admin(first_app, first_client, "persistent-first-admin")
         first_response = upload_csv(
             first_client,
             "customers",
@@ -909,7 +1025,8 @@ def test_baseline_persists_across_application_instances(tmp_path):
         auth_repository=SQLiteAuthRepository(database_path),
     )
 
-    with TestClient(second_app) as second_client:
+    with TestClient(second_app, base_url="https://testserver") as second_client:
+        authenticate_admin(second_app, second_client, "persistent-second-admin")
         second_response = upload_csv(
             second_client,
             "customers",
@@ -1463,3 +1580,377 @@ def test_occurrence_and_history_endpoints_reject_invalid_pagination(
     )
 
     assert response.status_code == 422
+
+
+def make_authorized_request(
+    client: TestClient,
+    method: str,
+    path: str,
+    *,
+    json=None,
+    data=None,
+    files=None,
+    headers=None,
+    params=None,
+):
+    return client.request(
+        method,
+        path,
+        json=json,
+        data=data,
+        files=files,
+        headers=headers,
+        params=params,
+    )
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "kwargs"),
+    [
+        ("GET", "/incidents", {}),
+        ("GET", "/incidents/one", {}),
+        ("GET", "/incidents/one/occurrences", {}),
+        ("GET", "/incidents/one/history", {}),
+        (
+            "PATCH",
+            "/incidents/one/status",
+            {
+                "json": {
+                    "status": "ACKNOWLEDGED",
+                    "expected_revision": 1,
+                    "reason": "Authorization test.",
+                }
+            },
+        ),
+        (
+            "POST",
+            "/datasets/analyze",
+            {
+                "data": {"dataset_id": "customers"},
+                "files": {
+                    "file": ("customers.csv", b"id\n1", "text/csv"),
+                },
+                "headers": {"Idempotency-Key": "authorization-no-session"},
+            },
+        ),
+        (
+            "PUT",
+            "/datasets/customers/schema",
+            {
+                "json": {
+                    "schema": {"id": "int64"},
+                    "expected_version": 1,
+                }
+            },
+        ),
+        ("GET", "/datasets/customers/schema/history", {}),
+    ],
+    ids=[
+        "list-incidents",
+        "get-incident",
+        "incident-occurrences",
+        "incident-history",
+        "change-status",
+        "analyze-dataset",
+        "approve-schema",
+        "schema-history",
+    ],
+)
+def test_protected_business_routes_return_401_without_session(
+    authorization_api,
+    method,
+    path,
+    kwargs,
+):
+    _, client, _, _, _ = authorization_api
+    client.cookies.clear()
+
+    response = make_authorized_request(client, method, path, **kwargs)
+
+    assert response.status_code == 401
+
+
+def test_protected_business_route_returns_401_for_invalid_cookie(
+    authorization_api,
+):
+    _, client, _, _, _ = authorization_api
+    client.cookies.clear()
+    client.cookies.set(SESSION_COOKIE_NAME, "invalid-session-token")
+
+    response = client.get("/incidents")
+
+    assert response.status_code == 401
+
+
+def test_protected_business_route_returns_401_for_revoked_session(
+    authorization_api,
+):
+    app, client, _, _, passwords = authorization_api
+    authenticated_session = authenticate_api_role(
+        app,
+        client,
+        UserRole.ADMIN,
+        passwords,
+    )
+    assert app.state.auth_service.logout(
+        authenticated_session.session_token
+    )
+
+    response = client.get("/incidents")
+
+    assert response.status_code == 401
+
+
+def test_viewer_cannot_mutate_without_creating_any_resource(
+    authorization_api,
+):
+    app, client, repository, incident_repository, passwords = authorization_api
+    authenticate_api_role(
+        app,
+        client,
+        UserRole.VIEWER,
+        passwords,
+    )
+
+    incident = make_api_incident("viewer-denied-incident")
+    store_api_incident(incident_repository, incident)
+    repository.get_or_create_initial("customers", {"id": "int64"})
+
+    analyze_response = client.post(
+        "/datasets/analyze",
+        data={"dataset_id": "viewer-denied"},
+        files={
+            "file": (
+                "viewer-denied.csv",
+                b"id,name\n1,Ana",
+                "text/csv",
+            ),
+        },
+        headers={"Idempotency-Key": "viewer-denied-analysis"},
+    )
+    approve_response = client.put(
+        "/datasets/customers/schema",
+        json={
+            "schema": {"id": "int64", "name": "str"},
+            "expected_version": 1,
+        },
+    )
+    status_response = client.patch(
+        f"/incidents/{incident.incident_id}/status",
+        json={
+            "status": "ACKNOWLEDGED",
+            "expected_revision": 1,
+            "reason": "Viewer must be denied.",
+        },
+    )
+
+    assert analyze_response.status_code == 403
+    assert approve_response.status_code == 403
+    assert status_response.status_code == 403
+    assert repository.get_current("viewer-denied") is None
+    assert incident_repository.get_incident(incident.incident_id) == incident
+    assert incident_repository.list_status_history(
+        incident.incident_id
+    ) == []
+    assert repository.get_current("customers").version == 1
+    assert repository.get_current("customers").schema == {"id": "int64"}
+
+
+def test_viewer_can_read_schema_history(
+    authorization_api,
+):
+    app, client, repository, _, passwords = authorization_api
+    authenticate_api_role(
+        app,
+        client,
+        UserRole.VIEWER,
+        passwords,
+    )
+    baseline = repository.get_or_create_initial(
+        "viewer-history",
+        {"id": "int64", "name": "str"},
+    )[0]
+
+    response = client.get("/datasets/viewer-history/schema/history")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "dataset_id": "viewer-history",
+        "versions": [
+            {
+                "version": baseline.version,
+                "schema": baseline.schema,
+                "created_at": baseline.created_at,
+            }
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    ("role", "operation", "expected_status"),
+    [
+        (UserRole.VIEWER, "analyze", 403),
+        (UserRole.VIEWER, "approve", 403),
+        (UserRole.VIEWER, "status", 403),
+        (UserRole.ANALYST, "analyze", 200),
+        (UserRole.ANALYST, "approve", 403),
+        (UserRole.ANALYST, "status", 403),
+        (UserRole.INCIDENT_OPERATOR, "analyze", 200),
+        (UserRole.INCIDENT_OPERATOR, "approve", 403),
+        (UserRole.INCIDENT_OPERATOR, "status", 200),
+        (UserRole.ADMIN, "analyze", 200),
+        (UserRole.ADMIN, "approve", 200),
+        (UserRole.ADMIN, "status", 200),
+    ],
+)
+def test_mutating_operation_role_permission_matrix(
+    authorization_api,
+    role,
+    operation,
+    expected_status,
+):
+    app, client, repository, incident_repository, passwords = authorization_api
+    authenticate_api_role(app, client, role, passwords)
+
+    if operation == "analyze":
+        response = client.post(
+            "/datasets/analyze",
+            data={"dataset_id": f"{role.value}-dataset"},
+            files={
+                "file": (
+                    f"{role.value}.csv",
+                    b"id,name\n1,Ana",
+                    "text/csv",
+                ),
+            },
+            headers={
+                "Idempotency-Key": f"{role.value}-{operation}",
+            },
+        )
+        assert response.status_code == expected_status
+        assert (
+            repository.get_current(f"{role.value}-dataset") is not None
+            if expected_status == 200
+            else repository.get_current(f"{role.value}-dataset") is None
+        )
+        return
+
+    if operation == "approve":
+        baseline = repository.get_or_create_initial(
+            f"{role.value}-schema",
+            {"id": "int64"},
+        )[0]
+        response = client.put(
+            f"/datasets/{role.value}-schema/schema",
+            json={
+                "schema": {"id": "int64", "name": "str"},
+                "expected_version": baseline.version,
+            },
+        )
+        assert response.status_code == expected_status
+        current = repository.get_current(f"{role.value}-schema")
+        assert current is not None
+        assert (
+            current.version == 2
+            if expected_status == 200
+            else current.version == 1
+        )
+        return
+
+    incident = make_api_incident(f"{role.value}-status")
+    store_api_incident(incident_repository, incident)
+    response = client.patch(
+        f"/incidents/{incident.incident_id}/status",
+        json={
+            "status": "ACKNOWLEDGED",
+            "expected_revision": 1,
+            "reason": f"{role.value} authorization test.",
+        },
+    )
+    assert response.status_code == expected_status
+    persisted = incident_repository.get_incident(incident.incident_id)
+    history = incident_repository.list_status_history(incident.incident_id)
+    assert persisted is not None
+    assert (
+        persisted.revision == 2
+        and len(history) == 1
+        if expected_status == 200
+        else persisted.revision == 1
+        and len(history) == 0
+    )
+
+
+def test_client_supplied_role_permission_and_identity_do_not_elevate(
+    authorization_api,
+):
+    app, client, repository, incident_repository, passwords = authorization_api
+    authenticate_api_role(
+        app,
+        client,
+        UserRole.VIEWER,
+        passwords,
+    )
+
+    incident = make_api_incident("query-role-spoof")
+    store_api_incident(incident_repository, incident)
+    query_spoof = client.patch(
+        f"/incidents/{incident.incident_id}/status",
+        params={
+            "role": "admin",
+            "permission": "incident:status:change",
+        },
+        json={
+            "status": "ACKNOWLEDGED",
+            "expected_revision": 1,
+            "reason": "Query supplied role.",
+        },
+    )
+    header_spoof = client.post(
+        "/datasets/analyze",
+        data={"dataset_id": "spoofed-dataset"},
+        files={
+            "file": (
+                "spoofed.csv",
+                b"id\n1",
+                "text/csv",
+            ),
+        },
+        headers={
+            "Idempotency-Key": "role-spoof",
+            "role": "admin",
+            "permission": "schema:approve",
+            "X-User-Id": "00000000-0000-0000-0000-000000000001",
+        },
+    )
+
+    body_incident = make_api_incident("body-role-spoof")
+    store_api_incident(incident_repository, body_incident)
+    body_spoof = client.patch(
+        f"/incidents/{body_incident.incident_id}/status",
+        params={"role": "admin"},
+        json={
+            "status": "ACKNOWLEDGED",
+            "expected_revision": 1,
+            "reason": "Client supplied identity.",
+            "role": "admin",
+            "permission": "incident:status:change",
+            "actor": "00000000-0000-0000-0000-000000000001",
+        },
+    )
+
+    assert query_spoof.status_code == 403
+    assert header_spoof.status_code == 403
+    assert body_spoof.status_code == 403
+    assert incident_repository.get_incident(
+        incident.incident_id
+    ) == incident
+    assert incident_repository.list_status_history(
+        incident.incident_id
+    ) == []
+    assert incident_repository.get_incident(
+        body_incident.incident_id
+    ) == body_incident
+    assert incident_repository.list_status_history(
+        body_incident.incident_id
+    ) == []
+    assert repository.get_current("spoofed-dataset") is None
