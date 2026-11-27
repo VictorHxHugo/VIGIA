@@ -3,6 +3,8 @@ import sqlite3
 from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
+from typing import cast
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -27,6 +29,7 @@ def test_creates_initial_schema_version(tmp_path):
     assert schema_version.dataset_id == "customers"
     assert schema_version.version == 1
     assert schema_version.schema == {"id": "int64", "name": "object"}
+    assert schema_version.approved_by_user_id is None
     assert repository.get_current("customers") == schema_version
     with closing(sqlite3.connect(database_path)) as connection:
         stored_schema = connection.execute(
@@ -71,22 +74,88 @@ def test_persists_versions_after_reopening_repository(tmp_path):
     assert reopened_repository.get_current("customers") == expected
 
 
+def test_migrates_existing_schema_versions_and_is_idempotent(tmp_path):
+    database_path = tmp_path / "legacy-registry.sqlite3"
+    with closing(sqlite3.connect(database_path)) as connection, connection:
+        connection.execute(
+            """
+            CREATE TABLE schema_versions (
+                dataset_id TEXT NOT NULL
+                    CHECK (length(trim(dataset_id)) > 0),
+                version INTEGER NOT NULL CHECK (version >= 1),
+                schema_json TEXT NOT NULL CHECK (json_valid(schema_json)),
+                created_at TEXT NOT NULL CHECK (length(created_at) > 0),
+                is_current INTEGER NOT NULL CHECK (is_current IN (0, 1)),
+                PRIMARY KEY (dataset_id, version)
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO schema_versions (
+                dataset_id, version, schema_json, created_at, is_current
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                "customers",
+                1,
+                '{"id":"int64"}',
+                "2026-01-01T00:00:00+00:00",
+                1,
+            ),
+        )
+
+    repository = SQLiteSchemaRegistryRepository(database_path)
+    legacy_version = repository.get_current("customers")
+
+    assert legacy_version is not None
+    assert legacy_version.schema == {"id": "int64"}
+    assert legacy_version.approved_by_user_id is None
+
+    reopened_repository = SQLiteSchemaRegistryRepository(database_path)
+    approved_by_user_id = uuid4()
+    approved = reopened_repository.approve_schema(
+        "customers",
+        {"id": "int64", "name": "object"},
+        expected_version=1,
+        approved_by_user_id=approved_by_user_id,
+    )
+
+    assert approved.approved_by_user_id == approved_by_user_id
+    versions = reopened_repository.list_versions("customers")
+    assert versions[0].approved_by_user_id is None
+    assert versions[1].approved_by_user_id == approved_by_user_id
+    with closing(sqlite3.connect(database_path)) as connection:
+        columns = [
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(schema_versions)"
+            )
+        ]
+
+    assert columns.count("approved_by_user_id") == 1
+
+
 def test_approval_creates_new_version_and_preserves_history(tmp_path):
     repository = SQLiteSchemaRegistryRepository(tmp_path / "registry.sqlite3")
     initial, _ = repository.get_or_create_initial(
         "customers",
         {"id": "int64"},
     )
+    approved_by_user_id = uuid4()
 
     approved = repository.approve_schema(
         "customers",
         {"id": "int64", "name": "object"},
         expected_version=1,
+        approved_by_user_id=approved_by_user_id,
     )
 
     assert approved.version == 2
     assert approved.schema == {"id": "int64", "name": "object"}
     assert approved.created_at
+    assert approved.approved_by_user_id == approved_by_user_id
     assert repository.get_current("customers") == approved
     assert repository.list_versions("customers") == [initial, approved]
 
@@ -98,6 +167,7 @@ def test_stale_approval_raises_conflict_without_changing_history(tmp_path):
         "customers",
         {"id": "int64", "name": "object"},
         expected_version=1,
+        approved_by_user_id=uuid4(),
     )
 
     with pytest.raises(SchemaVersionConflictError) as error:
@@ -105,6 +175,7 @@ def test_stale_approval_raises_conflict_without_changing_history(tmp_path):
             "customers",
             {"id": "object"},
             expected_version=1,
+            approved_by_user_id=uuid4(),
         )
 
     assert error.value.expected_version == 1
@@ -123,6 +194,7 @@ def test_approval_for_unknown_dataset_raises_not_found(tmp_path):
             "customers",
             {"id": "int64"},
             expected_version=1,
+            approved_by_user_id=uuid4(),
         )
 
 
@@ -145,6 +217,7 @@ def test_unit_of_work_uses_external_transaction_without_managing_it(tmp_path):
             "customers",
             {"id": "int64", "name": "object"},
             expected_version=1,
+            approved_by_user_id=uuid4(),
         )
 
         assert created is True
@@ -189,6 +262,7 @@ def test_unit_of_work_leaves_failed_operation_rollback_to_caller(tmp_path):
                 "customers",
                 {"id": "int64", "name": "object"},
                 expected_version=1,
+                approved_by_user_id=uuid4(),
             )
 
         assert connection.in_transaction is True
@@ -230,9 +304,31 @@ def test_independent_repository_validates_before_opening_connections(
     with pytest.raises(ValueError, match="data types"):
         repository.get_or_create_initial("customers", {"id": ""})
     with pytest.raises(ValueError, match="expected_version"):
-        repository.approve_schema("customers", {"id": "int64"}, 0)
+        repository.approve_schema(
+            "customers",
+            {"id": "int64"},
+            0,
+            approved_by_user_id=uuid4(),
+        )
     with pytest.raises(ValueError, match="dataset_id"):
         repository.list_versions("")
+
+
+def test_approval_requires_uuid_approver(tmp_path):
+    repository = SQLiteSchemaRegistryRepository(tmp_path / "registry.sqlite3")
+    repository.get_or_create_initial("customers", {"id": "int64"})
+
+    with pytest.raises(ValueError, match="approved_by_user_id must be a UUID"):
+        repository.approve_schema(
+            "customers",
+            {"id": "int64", "name": "object"},
+            expected_version=1,
+            approved_by_user_id=cast(UUID, "not-a-uuid"),
+        )
+
+    assert [version.version for version in repository.list_versions("customers")] == [
+        1
+    ]
 
 
 def test_failed_approval_rolls_back_current_version_change(tmp_path):
@@ -260,6 +356,7 @@ def test_failed_approval_rolls_back_current_version_change(tmp_path):
             "customers",
             {"id": "int64", "name": "object"},
             expected_version=1,
+            approved_by_user_id=uuid4(),
         )
 
     assert repository.get_current("customers") == initial
@@ -349,6 +446,7 @@ def test_concurrent_approvals_preserve_optimistic_version_conflicts(tmp_path):
                 "customers",
                 schema,
                 expected_version=1,
+                approved_by_user_id=uuid4(),
             )
         except SchemaVersionConflictError as error:
             return error
@@ -366,6 +464,9 @@ def test_concurrent_approvals_preserve_optimistic_version_conflicts(tmp_path):
     assert sum(
         not isinstance(result, SchemaVersionConflictError) for result in results
     ) == 1
+    successful_approval = repository.get_current("customers")
+    assert successful_approval is not None
+    assert successful_approval.approved_by_user_id is not None
     assert [version.version for version in repository.list_versions("customers")] == [
         1,
         2,

@@ -1042,8 +1042,14 @@ def test_baseline_persists_across_application_instances(tmp_path):
     assert second_result["schema_drift_issues"] == []
 
 
-def test_schema_approval_creates_new_version_and_history(api_client):
-    client, _ = api_client
+def test_schema_approval_creates_new_version_and_history(authorization_api):
+    app, client, repository, _, passwords = authorization_api
+    authenticated_session = authenticate_api_role(
+        app,
+        client,
+        UserRole.ADMIN,
+        passwords,
+    )
     upload_csv(
         client,
         "customers",
@@ -1076,6 +1082,14 @@ def test_schema_approval_creates_new_version_and_history(api_client):
     history = history_response.json()
     assert history["dataset_id"] == "customers"
     assert [version["version"] for version in history["versions"]] == [1, 2]
+    assert history["versions"][0]["approved_by_user_id"] is None
+    assert history["versions"][1]["approved_by_user_id"] == str(
+        authenticated_session.principal.user_id
+    )
+    stored_versions = repository.list_versions("customers")
+    assert stored_versions[1].approved_by_user_id == (
+        authenticated_session.principal.user_id
+    )
 
 
 def test_stale_schema_approval_returns_conflict(api_client):
@@ -1140,6 +1154,34 @@ def test_schema_approval_rejects_invalid_request_body(api_client):
     )
 
     assert response.status_code == 422
+
+
+def test_schema_approval_rejects_client_supplied_identity(authorization_api):
+    app, client, repository, _, passwords = authorization_api
+    authenticate_api_role(
+        app,
+        client,
+        UserRole.ADMIN,
+        passwords,
+    )
+    initial, _ = repository.get_or_create_initial(
+        "client-identity",
+        {"id": "int64"},
+    )
+
+    response = client.put(
+        "/datasets/client-identity/schema",
+        json={
+            "schema": {"id": "int64", "name": "object"},
+            "expected_version": initial.version,
+            "approved_by_user_id": "00000000-0000-0000-0000-000000000001",
+            "user_id": "00000000-0000-0000-0000-000000000001",
+            "actor": "client",
+        },
+    )
+
+    assert response.status_code == 422
+    assert repository.list_versions("client-identity") == [initial]
 
 
 def test_list_incidents_applies_combined_filters_and_pagination(
@@ -1340,11 +1382,15 @@ def test_incident_occurrences_and_history_return_404_for_missing_parent(
 
 
 def test_patch_incident_status_updates_revision_and_records_audit_fields(
-    api_client,
-    tmp_path,
+    authorization_api,
 ):
-    client, _ = api_client
-    incident_repository = SQLiteIncidentRepository(tmp_path / "registry.sqlite3")
+    app, client, _, incident_repository, passwords = authorization_api
+    authenticated_session = authenticate_api_role(
+        app,
+        client,
+        UserRole.INCIDENT_OPERATOR,
+        passwords,
+    )
     incident = make_api_incident("status-change-incident")
     store_api_incident(incident_repository, incident)
 
@@ -1369,8 +1415,38 @@ def test_patch_incident_status_updates_revision_and_records_audit_fields(
     assert persisted.status is IncidentStatus.ACKNOWLEDGED
     assert persisted.revision == incident.revision + 1
     assert len(history) == 1
-    assert history[0].actor == "api"
+    assert history[0].actor == str(authenticated_session.principal.user_id)
     assert history[0].reason == reason
+
+
+def test_patch_incident_status_rejects_client_supplied_identity(
+    authorization_api,
+):
+    app, client, _, incident_repository, passwords = authorization_api
+    authenticate_api_role(
+        app,
+        client,
+        UserRole.INCIDENT_OPERATOR,
+        passwords,
+    )
+    incident = make_api_incident("status-client-identity")
+    store_api_incident(incident_repository, incident)
+
+    response = client.patch(
+        f"/incidents/{incident.incident_id}/status",
+        json={
+            "status": "ACKNOWLEDGED",
+            "expected_revision": incident.revision,
+            "reason": "Client identity must not be accepted.",
+            "actor": "client-supplied",
+            "user_id": "00000000-0000-0000-0000-000000000001",
+            "role": "admin",
+        },
+    )
+
+    assert response.status_code == 422
+    assert incident_repository.get_incident(incident.incident_id) == incident
+    assert incident_repository.list_status_history(incident.incident_id) == []
 
 
 def test_patch_repeating_current_status_is_successful_no_op(
@@ -1781,6 +1857,7 @@ def test_viewer_can_read_schema_history(
                 "version": baseline.version,
                 "schema": baseline.schema,
                 "created_at": baseline.created_at,
+                "approved_by_user_id": None,
             }
         ],
     }

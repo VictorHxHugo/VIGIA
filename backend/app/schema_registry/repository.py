@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from typing import Protocol, TypeAlias
+from uuid import UUID
 
 
 Schema: TypeAlias = dict[str, str]
@@ -15,6 +16,14 @@ class SchemaVersion:
     version: int
     schema: Schema
     created_at: str
+    approved_by_user_id: UUID | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            self.approved_by_user_id is not None
+            and not isinstance(self.approved_by_user_id, UUID)
+        ):
+            raise ValueError("approved_by_user_id must be a UUID or None.")
 
 
 class DatasetNotFoundError(Exception):
@@ -63,6 +72,8 @@ class SchemaRegistryUnitOfWork(Protocol):
         dataset_id: str,
         schema: Schema,
         expected_version: int,
+        *,
+        approved_by_user_id: UUID,
     ) -> SchemaVersion:
         """Create a version if expected_version is still current."""
         ...
@@ -92,6 +103,8 @@ class SchemaRegistryRepository(Protocol):
         dataset_id: str,
         schema: Schema,
         expected_version: int,
+        *,
+        approved_by_user_id: UUID,
     ) -> SchemaVersion:
         """Create a version if expected_version is still current."""
         ...

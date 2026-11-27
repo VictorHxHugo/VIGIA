@@ -1,5 +1,7 @@
 import sqlite3
 from collections.abc import Sequence
+from typing import cast
+from uuid import UUID, uuid4
 
 import numpy as np
 import pandas as pd
@@ -259,15 +261,36 @@ def test_schema_registry_service_exposes_approval_and_history(analysis_setup):
         {"id": "int64"},
     )
 
+    approved_by_user_id = uuid4()
     approved = registry_service.approve_schema(
         "customers",
         {"id": "int64", "name": "object"},
         expected_version=initial.version,
+        approved_by_user_id=approved_by_user_id,
     )
 
     assert created is True
     assert approved.version == 2
+    assert approved.approved_by_user_id == approved_by_user_id
     assert registry_service.list_versions("customers") == [initial, approved]
+
+
+def test_schema_registry_service_rejects_missing_approver(analysis_setup):
+    _, registry_service, _, _ = analysis_setup
+    initial, _ = registry_service.get_or_create_baseline(
+        "customers",
+        {"id": "int64"},
+    )
+
+    with pytest.raises(ValueError, match="approved_by_user_id must be a UUID"):
+        registry_service.approve_schema(
+            "customers",
+            {"id": "int64", "name": "object"},
+            expected_version=initial.version,
+            approved_by_user_id=cast(UUID, None),
+        )
+
+    assert registry_service.list_versions("customers") == [initial]
 
 
 class RecordingIncidentService(IncidentService):

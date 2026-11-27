@@ -1,5 +1,7 @@
 """Application service for schema registry operations."""
 
+from uuid import UUID
+
 from app.schema_registry.repository import (
     Schema,
     SchemaRegistryRepository,
@@ -36,12 +38,17 @@ class SchemaRegistryService:
         dataset_id: str,
         schema: Schema,
         expected_version: int,
+        *,
+        approved_by_user_id: UUID,
     ) -> SchemaVersion:
         """Approve a new schema version if the expected version is current."""
+        if not isinstance(approved_by_user_id, UUID):
+            raise ValueError("approved_by_user_id must be a UUID.")
         return self._repository.approve_schema(
             dataset_id,
             schema,
             expected_version,
+            approved_by_user_id=approved_by_user_id,
         )
 
     def list_versions(self, dataset_id: str) -> list[SchemaVersion]:

@@ -6,6 +6,7 @@ from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from uuid import UUID
 
 from app.schema_registry.repository import (
     DatasetNotFoundError,
@@ -56,9 +57,10 @@ class SQLiteSchemaRegistryUnitOfWork(SchemaRegistryUnitOfWork):
                 version,
                 schema_json,
                 created_at,
-                is_current
+                is_current,
+                approved_by_user_id
             )
-            VALUES (?, 1, ?, ?, 1)
+            VALUES (?, 1, ?, ?, 1, NULL)
             """,
             (dataset_id, schema_json, created_at),
         )
@@ -73,17 +75,26 @@ class SQLiteSchemaRegistryUnitOfWork(SchemaRegistryUnitOfWork):
         dataset_id: str,
         schema: Schema,
         expected_version: int,
+        *,
+        approved_by_user_id: UUID,
     ) -> SchemaVersion:
         self._validate_dataset_id(dataset_id)
         self._validate_expected_version(expected_version)
+        self._validate_approver_id(approved_by_user_id)
         schema_json = self._serialize_schema(schema)
-        return self._approve_schema(dataset_id, schema_json, expected_version)
+        return self._approve_schema(
+            dataset_id,
+            schema_json,
+            expected_version,
+            approved_by_user_id,
+        )
 
     def _approve_schema(
         self,
         dataset_id: str,
         schema_json: str,
         expected_version: int,
+        approved_by_user_id: UUID,
     ) -> SchemaVersion:
         current_row = self._get_current_row(dataset_id)
         if current_row is None:
@@ -121,11 +132,18 @@ class SQLiteSchemaRegistryUnitOfWork(SchemaRegistryUnitOfWork):
                 version,
                 schema_json,
                 created_at,
-                is_current
+                is_current,
+                approved_by_user_id
             )
-            VALUES (?, ?, ?, ?, 1)
+            VALUES (?, ?, ?, ?, 1, ?)
             """,
-            (dataset_id, next_version, schema_json, created_at),
+            (
+                dataset_id,
+                next_version,
+                schema_json,
+                created_at,
+                str(approved_by_user_id),
+            ),
         )
         row = self._get_current_row(dataset_id)
         if row is None:
@@ -140,7 +158,12 @@ class SQLiteSchemaRegistryUnitOfWork(SchemaRegistryUnitOfWork):
     def _list_versions(self, dataset_id: str) -> list[SchemaVersion]:
         rows = self._connection.execute(
             """
-            SELECT dataset_id, version, schema_json, created_at
+            SELECT
+                dataset_id,
+                version,
+                schema_json,
+                created_at,
+                approved_by_user_id
             FROM schema_versions
             WHERE dataset_id = ?
             ORDER BY version ASC
@@ -152,7 +175,12 @@ class SQLiteSchemaRegistryUnitOfWork(SchemaRegistryUnitOfWork):
     def _get_current_row(self, dataset_id: str) -> sqlite3.Row | None:
         return self._connection.execute(
             """
-            SELECT dataset_id, version, schema_json, created_at
+            SELECT
+                dataset_id,
+                version,
+                schema_json,
+                created_at,
+                approved_by_user_id
             FROM schema_versions
             WHERE dataset_id = ? AND is_current = 1
             """,
@@ -167,11 +195,17 @@ class SQLiteSchemaRegistryUnitOfWork(SchemaRegistryUnitOfWork):
             raise ValueError("Stored schema is not valid JSON.") from exc
 
         cls._validate_schema(schema)
+        approved_by_user_id = (
+            UUID(row["approved_by_user_id"])
+            if row["approved_by_user_id"] is not None
+            else None
+        )
         return SchemaVersion(
             dataset_id=row["dataset_id"],
             version=row["version"],
             schema=schema,
             created_at=row["created_at"],
+            approved_by_user_id=approved_by_user_id,
         )
 
     @staticmethod
@@ -212,6 +246,11 @@ class SQLiteSchemaRegistryUnitOfWork(SchemaRegistryUnitOfWork):
             or expected_version < 1
         ):
             raise ValueError("expected_version must be an integer greater than zero.")
+
+    @staticmethod
+    def _validate_approver_id(approved_by_user_id: UUID) -> None:
+        if not isinstance(approved_by_user_id, UUID):
+            raise ValueError("approved_by_user_id must be a UUID.")
 
     @staticmethod
     def _utc_now() -> str:
@@ -269,16 +308,22 @@ class SQLiteSchemaRegistryRepository:
         dataset_id: str,
         schema: Schema,
         expected_version: int,
+        *,
+        approved_by_user_id: UUID,
     ) -> SchemaVersion:
         """Atomically append a schema version when the expected version is current."""
         SQLiteSchemaRegistryUnitOfWork._validate_dataset_id(dataset_id)
         SQLiteSchemaRegistryUnitOfWork._validate_expected_version(expected_version)
+        SQLiteSchemaRegistryUnitOfWork._validate_approver_id(
+            approved_by_user_id
+        )
         schema_json = SQLiteSchemaRegistryUnitOfWork._serialize_schema(schema)
         with self._write_transaction() as connection:
             return SQLiteSchemaRegistryUnitOfWork(connection)._approve_schema(
                 dataset_id,
                 schema_json,
                 expected_version,
+                approved_by_user_id,
             )
 
     def list_versions(self, dataset_id: str) -> list[SchemaVersion]:
@@ -290,7 +335,7 @@ class SQLiteSchemaRegistryRepository:
             )
 
     def _initialize_database(self) -> None:
-        with self._connection() as connection:
+        with self._write_transaction() as connection:
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS schema_versions (
@@ -308,6 +353,17 @@ class SQLiteSchemaRegistryRepository:
                 )
                 """
             )
+            columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(schema_versions)"
+                ).fetchall()
+            }
+            if "approved_by_user_id" not in columns:
+                connection.execute(
+                    "ALTER TABLE schema_versions "
+                    "ADD COLUMN approved_by_user_id TEXT"
+                )
             connection.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS
@@ -316,7 +372,6 @@ class SQLiteSchemaRegistryRepository:
                 WHERE is_current = 1
                 """
             )
-            connection.commit()
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:

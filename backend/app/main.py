@@ -506,7 +506,7 @@ def create_app(
                 incident_id,
                 request.status,
                 expected_revision=request.expected_revision,
-                actor="api",
+                actor=str(principal.user_id),
                 reason=request.reason,
             )
         except IncidentNotFoundError as exc:
@@ -672,6 +672,7 @@ def create_app(
                 dataset_id,
                 request.schema_,
                 request.expected_version,
+                approved_by_user_id=principal.user_id,
             )
         except DatasetNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -725,6 +726,11 @@ def create_app(
                     "version": version.version,
                     "schema": version.schema,
                     "created_at": version.created_at,
+                    "approved_by_user_id": (
+                        str(version.approved_by_user_id)
+                        if version.approved_by_user_id is not None
+                        else None
+                    ),
                 }
                 for version in versions
             ],
